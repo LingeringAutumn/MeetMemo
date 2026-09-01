@@ -3,14 +3,17 @@ import Foundation
 enum SpeakerClustering {
     /// Online incremental assignment: returns the speaker index that best matches the
     /// given embedding, creating a new one if no existing centroid is similar enough.
+    /// Returns `nil` when the extractor produced an unusable embedding, so a transient
+    /// model failure does not create a bogus speaker or crash on a dimension mismatch.
     /// `centroids` is updated in place — the matched centroid's running mean is refined
     /// to incorporate the new sample, and a fresh entry is appended when none qualifies.
     static func assignOnline(
         embedding: [Float],
         centroids: inout [(centroid: [Float], count: Int)],
         threshold: Float = 0.60
-    ) -> Int {
+    ) -> Int? {
         let normalized = normalize(embedding)
+        guard !normalized.isEmpty else { return nil }
 
         var bestIndex = -1
         var bestSimilarity: Float = -.infinity
@@ -59,7 +62,11 @@ enum SpeakerClustering {
                     }
                 }
             }
-            if bestSimilarity < threshold { break }
+            guard bestPair.0 >= 0,
+                  bestPair.1 >= 0,
+                  bestSimilarity >= threshold else {
+                break
+            }
             let merged = clusters[bestPair.0] + clusters[bestPair.1]
             clusters.remove(at: bestPair.1)
             clusters[bestPair.0] = merged
@@ -77,19 +84,25 @@ enum SpeakerClustering {
     // MARK: - Math primitives
 
     static func cosineSimilarity(_ a: [Float], _ b: [Float]) -> Float {
-        precondition(a.count == b.count, "embedding dimensionality mismatch")
+        guard !a.isEmpty,
+              a.count == b.count,
+              a.allSatisfy({ $0.isFinite }),
+              b.allSatisfy({ $0.isFinite }) else {
+            return -.infinity
+        }
         var dot: Float = 0
         for i in 0..<a.count {
             dot += a[i] * b[i]
         }
-        return dot
+        return dot.isFinite ? dot : -.infinity
     }
 
     static func normalize(_ vector: [Float]) -> [Float] {
+        guard !vector.isEmpty, vector.allSatisfy({ $0.isFinite }) else { return [] }
         var sumSquares: Float = 0
         for value in vector { sumSquares += value * value }
         let norm = sqrt(sumSquares)
-        guard norm > .ulpOfOne else { return vector }
+        guard norm.isFinite, norm > .ulpOfOne else { return [] }
         return vector.map { $0 / norm }
     }
 

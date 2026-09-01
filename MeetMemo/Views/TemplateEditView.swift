@@ -93,14 +93,16 @@ struct TemplateEditView: View {
     }
 }
 
-#Preview {
-    NavigationStack {
-        TemplateEditView(
-            template: NoteTemplate(
-                title: "示例模板",
-                context: "这是一段示例提示词。请按“摘要、重点、行动项”的结构生成会议纪要。"
-            )
-        ) { _ in }
+#if canImport(PreviewsMacros)
+    #Preview {
+        NavigationStack {
+            TemplateEditView(
+                template: NoteTemplate(
+                    title: "示例模板",
+                    context: "这是一段示例提示词。请按“摘要、重点、行动项”的结构生成会议纪要。"
+                )
+            ) { _ in }
+        }
+        .environmentObject(LanguageManager.shared)
     }
-    .environmentObject(LanguageManager.shared)
-}
+#endif

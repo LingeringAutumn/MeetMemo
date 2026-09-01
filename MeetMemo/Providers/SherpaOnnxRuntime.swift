@@ -20,7 +20,10 @@ import Foundation
 /// See `Frameworks/swift-wrapper/` for the matching `SherpaOnnx.swift` wrapper
 /// and bridging header that need to be added to the Xcode target before
 /// turning the `SHERPA_ONNX_ENABLED` flag on.
-final class SherpaOnnxRuntime {
+/// Instances are created and consumed exclusively on `SherpaSTTProvider.workQueue`.
+/// The unchecked conformance documents that queue confinement so a freshly built runtime
+/// can cross the async continuation used during connection without Swift 6 sendability races.
+final class SherpaOnnxRuntime: @unchecked Sendable {
     struct Segment {
         let samples: [Float]
         let text: String

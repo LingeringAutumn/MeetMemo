@@ -6,9 +6,6 @@ enum VoiceInputTiming {
     /// 取 2.2s：覆盖 SenseVoice 离线尾段解码，又不至于让用户停止后明显卡顿。
     static let finalFlushTimeout: TimeInterval = 2.2
 
-    /// finalization 完成后再多等一拍，给最后一个 onTranscriptUpdate 回调落地的时间。
-    static let postFinalizationDrainDelay: Duration = .milliseconds(120)
-
     /// 停止时补发的尾部静音时长，促使 VAD/解码器吐出最后一段。
     /// 1/3 秒经验值：足够触发尾段切分，又不会明显拉长结束延迟。
     static let trailingSilenceDuration: TimeInterval = 1.0 / 3.0

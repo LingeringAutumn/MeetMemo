@@ -45,4 +45,31 @@ final class AudioRecordingStateMachineTests: XCTestCase {
         XCTAssertTrue(machine.state.isActiveSession(activeSessionID))
         XCTAssertFalse(machine.state.isActiveSession(staleSessionID))
     }
+
+    func testOverlappingStartCannotReplaceActiveSession() {
+        let activeSessionID = UUID()
+        let overlappingSessionID = UUID()
+        var machine = AudioRecordingStateMachine()
+
+        XCTAssertTrue(machine.start(sessionID: activeSessionID))
+        machine.markRecording(sessionID: activeSessionID)
+
+        XCTAssertFalse(machine.start(sessionID: overlappingSessionID))
+        XCTAssertEqual(machine.state, .recording(activeSessionID))
+    }
+
+    func testStaleStopCannotTerminateActiveSession() {
+        let activeSessionID = UUID()
+        let staleSessionID = UUID()
+        var machine = AudioRecordingStateMachine()
+
+        XCTAssertTrue(machine.start(sessionID: activeSessionID))
+        machine.markRecording(sessionID: activeSessionID)
+
+        XCTAssertFalse(machine.stop(sessionID: staleSessionID))
+        XCTAssertEqual(machine.state, .recording(activeSessionID))
+        XCTAssertTrue(machine.stop(sessionID: activeSessionID))
+        XCTAssertFalse(machine.stop(sessionID: activeSessionID))
+        XCTAssertEqual(machine.state, .stopping(activeSessionID))
+    }
 }

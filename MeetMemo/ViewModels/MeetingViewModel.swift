@@ -42,6 +42,41 @@ enum MeetingViewTab: String, CaseIterable {
     }
 }
 
+/// Immutable identity for one asynchronous recording-start attempt. Model setup can
+/// suspend for a long time, so completion is allowed to mutate state only while the
+/// same meeting and generation are still current.
+struct MeetingRecordingStartRequest: Equatable {
+    let meetingID: UUID
+    let generation: Int
+
+    func isCurrent(
+        currentMeetingID: UUID,
+        currentGeneration: Int,
+        isDeleted: Bool
+    ) -> Bool {
+        meetingID == currentMeetingID
+            && generation == currentGeneration
+            && !isDeleted
+    }
+
+    func canCommit(
+        currentMeetingID: UUID,
+        currentGeneration: Int,
+        isDeleted: Bool,
+        activeMeetingID: UUID?,
+        isRecording: Bool,
+        isStopping: Bool
+    ) -> Bool {
+        isCurrent(
+            currentMeetingID: currentMeetingID,
+            currentGeneration: currentGeneration,
+            isDeleted: isDeleted
+        ) && activeMeetingID == nil
+            && !isRecording
+            && !isStopping
+    }
+}
+
 
 
 @MainActor
@@ -113,6 +148,8 @@ class MeetingViewModel: ObservableObject {
     private var hasLocalUnsavedChanges = false
     private var isApplyingLoadedMeeting = false
     private var isStreamingGeneratedNotes = false
+    private var recordingStartTask: Task<Void, Never>?
+    private var recordingStartGeneration: Int = 0
     private var generationTask: Task<Void, Never>?
     private var activeGenerationMeetingId: UUID?
     private var generationCounter: Int = 0
@@ -219,6 +256,9 @@ class MeetingViewModel: ObservableObject {
                     print("ℹ️ Suppressed non-critical error: \(errorMessage)")
                     return
                 }
+                if self.isStartingRecording {
+                    self.cancelPendingRecordingStart()
+                }
                 self.errorMessage = errorMessage
                 print("🚨 Recording Session Manager Error: \(errorMessage)")
             }
@@ -259,7 +299,7 @@ class MeetingViewModel: ObservableObject {
                 self.hasLocalUnsavedChanges = true
 
                 guard self.hasCompletedInitialLoad else { return }
-                print("🔄 Auto-saving meeting: \(meeting.id) - title: '\(meeting.title)', context: '\(meeting.formattedMeetingContext.prefix(50))...'")
+                print("🔄 Auto-saving meeting: \(meeting.id)")
                 self.saveMeeting()
             }
             .store(in: &cancellables)
@@ -284,6 +324,7 @@ class MeetingViewModel: ObservableObject {
             .compactMap { $0.object as? Meeting }
             .sink { [weak self] deleting in
                 guard let self, deleting.id == self.meeting.id else { return }
+                self.cancelPendingRecordingStart()
                 self.cancelGeneratingNotes(for: deleting.id)
                 self.saveMeeting()
             }
@@ -294,6 +335,7 @@ class MeetingViewModel: ObservableObject {
             .compactMap { $0.object as? Meeting }
             .sink { [weak self] deleted in
                 guard let self, deleted.id == self.meeting.id else { return }
+                self.cancelPendingRecordingStart()
                 self.cancelGeneratingNotes(for: deleted.id)
                 self.hasLocalUnsavedChanges = false
                 self.isDeleted = true
@@ -309,6 +351,7 @@ class MeetingViewModel: ObservableObject {
     ) {
         guard meeting.id != self.meeting.id else { return }
 
+        cancelPendingRecordingStart()
         deleteIfEmpty()
 
         print("🔁 Switching detail meeting: \(meeting.id)")
@@ -552,14 +595,26 @@ class MeetingViewModel: ObservableObject {
     }
     
     func startRecording() {
-        guard !isStartingRecording else { return }
+        guard !isStartingRecording,
+              recordingSessionManager.activeMeetingId == nil,
+              !recordingSessionManager.isRecording,
+              !recordingSessionManager.isStoppingRecording else {
+            return
+        }
+
+        recordingStartTask?.cancel()
+        recordingStartGeneration &+= 1
+        let request = MeetingRecordingStartRequest(
+            meetingID: meeting.id,
+            generation: recordingStartGeneration
+        )
+        let requestedEngine = UserDefaultsManager.shared.sttEngine
         isStartingRecording = true
         errorMessage = nil
 
-        Task { @MainActor [weak self] in
-            guard let self else { return }
+        recordingStartTask = Task { @MainActor [weak self] in
             do {
-                switch UserDefaultsManager.shared.sttEngine {
+                switch requestedEngine {
                 case .appleSpeechAnalyzer:
                     try await SpeechModelInstaller.shared.ensureReadyForUse()
                 case .sherpaSenseVoice:
@@ -571,13 +626,65 @@ class MeetingViewModel: ObservableObject {
                         throw FunASRNanoError.modelsNotReady
                     }
                 }
+
+                guard !Task.isCancelled, let self else { return }
+                guard requestedEngine == UserDefaultsManager.shared.sttEngine,
+                      request.canCommit(
+                        currentMeetingID: self.meeting.id,
+                        currentGeneration: self.recordingStartGeneration,
+                        isDeleted: self.isDeleted,
+                        activeMeetingID: self.recordingSessionManager.activeMeetingId,
+                        isRecording: self.recordingSessionManager.isRecording,
+                        isStopping: self.recordingSessionManager.isStoppingRecording
+                      ) else {
+                    self.finishRecordingStart(request, clearStartingState: true)
+                    return
+                }
+
+                self.recordingSessionManager.startRecording(
+                    for: request.meetingID,
+                    existingChunks: self.meeting.transcriptChunks
+                )
+                guard self.recordingSessionManager.activeMeetingId == request.meetingID else {
+                    self.finishRecordingStart(request, clearStartingState: true)
+                    return
+                }
+
                 self.hasStartedRecordingSession = true
                 self.toolbarHasStartedRecordingSession = true
-                self.recordingSessionManager.startRecording(for: self.meeting.id, existingChunks: self.meeting.transcriptChunks)
+                self.finishRecordingStart(request, clearStartingState: false)
             } catch {
+                guard let self,
+                      request.isCurrent(
+                        currentMeetingID: self.meeting.id,
+                        currentGeneration: self.recordingStartGeneration,
+                        isDeleted: self.isDeleted
+                      ) else {
+                    return
+                }
+
+                self.finishRecordingStart(request, clearStartingState: true)
+                guard !(error is CancellationError) else { return }
                 self.errorMessage = ErrorHandler.shared.handleError(error)
-                self.isStartingRecording = false
             }
+        }
+    }
+
+    private func cancelPendingRecordingStart() {
+        recordingStartGeneration &+= 1
+        recordingStartTask?.cancel()
+        recordingStartTask = nil
+        isStartingRecording = false
+    }
+
+    private func finishRecordingStart(
+        _ request: MeetingRecordingStartRequest,
+        clearStartingState: Bool
+    ) {
+        guard request.generation == recordingStartGeneration else { return }
+        recordingStartTask = nil
+        if clearStartingState {
+            isStartingRecording = false
         }
     }
     
@@ -1219,6 +1326,8 @@ class MeetingViewModel: ObservableObject {
     }
     
     func deleteMeeting() {
+        cancelPendingRecordingStart()
+
         // If this meeting is currently being recorded, stop the recording first
         if recordingSessionManager.isRecordingMeeting(meeting.id) {
             print("🛑 Stopping recording for meeting being deleted: \(meeting.id)")

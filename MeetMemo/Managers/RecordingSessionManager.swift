@@ -2,6 +2,19 @@ import Foundation
 import SwiftUI
 import Combine
 
+/// Captures the ownership of one debounced transcript write. The meeting/session identity
+/// must travel with the chunks; looking up the current meeting after the debounce delay can
+/// otherwise write a stopped meeting's last update into a newly started meeting.
+struct RecordingTranscriptSaveRequest {
+    let meetingID: UUID
+    let sessionToken: UUID
+    let chunks: [TranscriptChunk]
+
+    func belongsTo(meetingID: UUID?, sessionToken: UUID?) -> Bool {
+        self.meetingID == meetingID && self.sessionToken == sessionToken
+    }
+}
+
 /// Manages recording sessions at the app level to persist across navigation
 @MainActor
 class RecordingSessionManager: ObservableObject {
@@ -19,7 +32,7 @@ class RecordingSessionManager: ObservableObject {
     
     private let audioManager = AudioManager.shared
     private var cancellables = Set<AnyCancellable>()
-    private let transcriptUpdateSubject = PassthroughSubject<[TranscriptChunk], Never>()
+    private let transcriptUpdateSubject = PassthroughSubject<RecordingTranscriptSaveRequest, Never>()
     private var isStoppingFromSessionManager = false
     private var hasObservedAudioRecordingStart = false
     private var activeSessionToken: UUID?
@@ -35,7 +48,19 @@ class RecordingSessionManager: ObservableObject {
     private func setupAudioManagerBindings() {
         audioManager.$isStoppingRecording
             .sink { [weak self] value in
-                self?.isStoppingRecording = value
+                guard let self else { return }
+                let didFinishAutomaticStop = self.isStoppingRecording && !value
+                self.isStoppingRecording = value
+
+                guard didFinishAutomaticStop,
+                      self.activeMeetingId != nil,
+                      !self.isStoppingFromSessionManager,
+                      self.hasObservedAudioRecordingStart else {
+                    return
+                }
+
+                print("🧹 Audio manager finished an automatic stop. Saving the final transcript.")
+                self.finishActiveSession(saveFinalTranscript: true)
             }
             .store(in: &cancellables)
 
@@ -58,6 +83,7 @@ class RecordingSessionManager: ObservableObject {
 
                 guard self.activeMeetingId != nil,
                       !self.isStoppingFromSessionManager,
+                      !self.audioManager.isStoppingRecording,
                       self.hasObservedAudioRecordingStart else {
                     return
                 }
@@ -95,13 +121,19 @@ class RecordingSessionManager: ObservableObject {
             .sink { [weak self] newChunks in
                 guard let self,
                       self.activeMeetingId != nil,
-                      self.isRecording || self.isStoppingFromSessionManager else {
+                      self.isRecording || self.isStoppingRecording || self.isStoppingFromSessionManager else {
                     return
                 }
                 self.activeRecordingTranscriptChunks = newChunks
                 self.activeRecordingTranscriptChunksUpdated = newChunks
 
-                self.transcriptUpdateSubject.send(newChunks)
+                guard let meetingID = self.activeMeetingId,
+                      let sessionToken = self.activeSessionToken else { return }
+                self.transcriptUpdateSubject.send(RecordingTranscriptSaveRequest(
+                    meetingID: meetingID,
+                    sessionToken: sessionToken,
+                    chunks: newChunks
+                ))
             }
             .store(in: &cancellables)
     }
@@ -109,15 +141,29 @@ class RecordingSessionManager: ObservableObject {
     private func setupDebouncedSaving() {
         transcriptUpdateSubject
             .debounce(for: .seconds(2), scheduler: DispatchQueue.main)
-            .sink { [weak self] chunks in
-                guard let self = self, let activeMeetingId = self.activeMeetingId else { return }
-                print("💾 Debounced save triggered for meeting: \(activeMeetingId.uuidString)")
-                self.updateActiveMeetingTranscript(meetingId: activeMeetingId, chunks: chunks)
+            .sink { [weak self] request in
+                guard let self,
+                      request.belongsTo(
+                        meetingID: self.activeMeetingId,
+                        sessionToken: self.activeSessionToken
+                      ) else { return }
+                print("💾 Debounced save triggered for meeting: \(request.meetingID.uuidString)")
+                self.updateActiveMeetingTranscript(meetingId: request.meetingID, chunks: request.chunks)
             }
             .store(in: &cancellables)
     }
     
     func startRecording(for meetingId: UUID, existingChunks: [TranscriptChunk] = []) {
+        guard activeMeetingId == nil,
+              !isRecording,
+              !isStoppingRecording else {
+            warningMessage = LanguageManager.shared.t(
+                "已有录音正在进行或收尾，请先等待其完成。",
+                "A recording is already active or finalizing. Wait for it to finish."
+            )
+            return
+        }
+
         // 会议录音与语音输入互斥：开始录音前先静默停止正在进行的语音输入。
         VoiceInputManager.shared.cancelForRecording()
         print("🎙️ Starting recording for meeting: \(meetingId)")

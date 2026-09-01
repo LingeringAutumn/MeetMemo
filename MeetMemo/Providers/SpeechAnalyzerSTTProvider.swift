@@ -35,8 +35,10 @@ final class SpeechAnalyzerSTTProvider: NSObject, STTProvider {
 
     func connect(config: STTProviderConfig) async throws {
         disconnect()
+        try Task.checkCancellation()
 
         let resolvedLocale = try await SpeechModelInstaller.shared.ensureReadyForUse(for: config.locale)
+        try Task.checkCancellation()
         let transcriber = SpeechModelInstaller.makeTranscriber(
             locale: resolvedLocale,
             includeTimeRange: true,
@@ -49,6 +51,7 @@ final class SpeechAnalyzerSTTProvider: NSObject, STTProvider {
 
         // Get the format the analyzer requires and build a converter from our 16kHz Int16 source
         if let targetFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) {
+            try Task.checkCancellation()
             analyzerFormat = targetFormat
             if targetFormat != sourceFormat {
                 converter = AVAudioConverter(from: sourceFormat, to: targetFormat)
@@ -165,20 +168,21 @@ final class SpeechAnalyzerSTTProvider: NSObject, STTProvider {
         return task
     }
 
-    private static func waitForTask<Success>(_ task: Task<Success, Never>, timeout: TimeInterval) async -> Success? {
-        await withTaskGroup(of: Success?.self) { group in
-            group.addTask {
-                .some(await task.value)
+    private static func waitForTask<Success: Sendable>(
+        _ task: Task<Success, Never>,
+        timeout: TimeInterval
+    ) async -> Success? {
+        await withCheckedContinuation { continuation in
+            let gate = SpeechTaskTimeoutGate(continuation)
+            Task {
+                gate.resolve(await task.value)
             }
-            group.addTask {
-                try? await Task.sleep(for: .seconds(timeout))
-                task.cancel()  // unblock the awaiting child task so withTaskGroup can return
-                return nil
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(
+                deadline: .now() + max(0, timeout)
+            ) {
+                task.cancel()
+                gate.resolve(nil)
             }
-
-            let result = await group.next() ?? nil
-            group.cancelAll()
-            return result
         }
     }
 
@@ -207,16 +211,10 @@ final class SpeechAnalyzerSTTProvider: NSObject, STTProvider {
             return nil
         }
 
-        var didProvideInput = false
         var conversionError: NSError?
+        let converterInput = SpeechAnalyzerConverterInput(buffer: inputBuffer)
         let status = conv.convert(to: outputBuffer, error: &conversionError) { _, outStatus in
-            if didProvideInput {
-                outStatus.pointee = .noDataNow
-                return nil
-            }
-            didProvideInput = true
-            outStatus.pointee = .haveData
-            return inputBuffer
+            converterInput.next(status: outStatus)
         }
 
         guard conversionError == nil,
@@ -240,6 +238,51 @@ final class SpeechAnalyzerSTTProvider: NSObject, STTProvider {
         let seconds = CMTimeGetSeconds(time)
         guard seconds.isFinite, seconds >= 0 else { return nil }
         return Int((seconds * 1000).rounded())
+    }
+}
+
+/// `AVAudioConverter` models its input block as concurrently callable. Keep the one-shot
+/// cursor behind a lock instead of capturing and mutating a local Boolean.
+@available(macOS 26.0, *)
+private final class SpeechAnalyzerConverterInput: @unchecked Sendable {
+    private let lock = NSLock()
+    private let buffer: AVAudioPCMBuffer
+    private var didProvideInput = false
+
+    init(buffer: AVAudioPCMBuffer) {
+        self.buffer = buffer
+    }
+
+    func next(status: UnsafeMutablePointer<AVAudioConverterInputStatus>) -> AVAudioBuffer? {
+        lock.withLock {
+            guard !didProvideInput else {
+                status.pointee = .noDataNow
+                return nil
+            }
+            didProvideInput = true
+            status.pointee = .haveData
+            return buffer
+        }
+    }
+}
+
+/// A task timeout must return when the deadline wins even if the underlying Speech task does
+/// not cooperate with cancellation. Structured task groups wait for their losing child on
+/// scope exit, so use a thread-safe one-shot continuation instead.
+private final class SpeechTaskTimeoutGate<Value: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Value?, Never>?
+
+    init(_ continuation: CheckedContinuation<Value?, Never>) {
+        self.continuation = continuation
+    }
+
+    func resolve(_ value: Value?) {
+        let continuationToResume: CheckedContinuation<Value?, Never>? = lock.withLock {
+            defer { continuation = nil }
+            return continuation
+        }
+        continuationToResume?.resume(returning: value)
     }
 }
 

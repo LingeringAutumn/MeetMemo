@@ -280,21 +280,23 @@ private func inlineMarkdown(_ source: String) -> AttributedString {
     return AttributedString(source)
 }
 
-#Preview {
-    RenderedNotesView(text: """
-    # Heading 1
-    ## Heading 2
-    - List item with **bold** text
-        - Nested item
-            - Deeper item
-    1. Ordered
-        1. Nested ordered
+#if canImport(PreviewsMacros)
+    #Preview {
+        RenderedNotesView(text: """
+        # Heading 1
+        ## Heading 2
+        - List item with **bold** text
+            - Nested item
+                - Deeper item
+        1. Ordered
+            1. Nested ordered
 
-    | 问题描述 | 讨论结果 | 决策人 |
-    | --- | --- | --- |
-    | AI 知识库中保险条款回复失真，需要全面审查所有条目（约 140 条） | 客服人力不足，建议由业务负责判断逻辑合理性 | 发言人 A |
-    | AI 咨询已紧急下线，导致客服压力增大 | 会议未明确恢复时间，决定明天给出责任归属结论后再推动后续动作 | 待确认 |
+        | 问题描述 | 讨论结果 | 决策人 |
+        | --- | --- | --- |
+        | AI 知识库中保险条款回复失真，需要全面审查所有条目（约 140 条） | 客服人力不足，建议由业务负责判断逻辑合理性 | 发言人 A |
+        | AI 咨询已紧急下线，导致客服压力增大 | 会议未明确恢复时间，决定明天给出责任归属结论后再推动后续动作 | 待确认 |
 
-    Normal text with **strong emphasis**.
-    """)
-}
+        Normal text with **strong emphasis**.
+        """)
+    }
+#endif

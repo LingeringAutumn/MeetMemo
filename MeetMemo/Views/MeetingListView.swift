@@ -2847,7 +2847,9 @@ private struct OpenQuestionRow: View {
     }
 }
 
-#Preview {
-    MeetingListView(settingsViewModel: SettingsViewModel())
-        .environmentObject(LanguageManager.shared)
-}
+#if canImport(PreviewsMacros)
+    #Preview {
+        MeetingListView(settingsViewModel: SettingsViewModel())
+            .environmentObject(LanguageManager.shared)
+    }
+#endif

@@ -43,8 +43,14 @@ enum AudioRecordingState: Equatable {
 struct AudioRecordingStateMachine {
     private(set) var state: AudioRecordingState = .idle
 
-    mutating func start(sessionID: UUID) {
+    /// Starts a new session only after the previous one has been fully reset.
+    /// Returning `false` lets callers/tests detect duplicate or overlapping starts
+    /// without allowing them to replace the active session identity.
+    @discardableResult
+    mutating func start(sessionID: UUID) -> Bool {
+        guard case .idle = state else { return false }
         state = .starting(sessionID)
+        return true
     }
 
     mutating func markRecording(sessionID: UUID) {
@@ -57,8 +63,13 @@ struct AudioRecordingStateMachine {
         state = .recovering(sessionID)
     }
 
-    mutating func stop(sessionID: UUID) {
+    /// Stops only the session that currently owns the state machine. A late stop
+    /// from an older session must never terminate a newer recording.
+    @discardableResult
+    mutating func stop(sessionID: UUID) -> Bool {
+        guard state.sessionID == sessionID, !state.isStopping else { return false }
         state = .stopping(sessionID)
+        return true
     }
 
     mutating func reset() {

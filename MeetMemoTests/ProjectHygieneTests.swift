@@ -32,6 +32,44 @@ final class ProjectHygieneTests: XCTestCase {
         XCTAssertTrue(script.contains("APP_PASSWORD: Set"))
     }
 
+    func testSherpaBuildDependenciesStayPinnedAndChecksumVerified() throws {
+        let root = repositoryRoot()
+        let script = try read("scripts/fetch_sherpa_frameworks.sh", from: root)
+        let project = try read("MeetMemo.xcodeproj/project.pbxproj", from: root)
+
+        XCTAssertTrue(script.contains("readonly DEFAULT_SHERPA_ONNX_VERSION=\"v1.13.2\""))
+        XCTAssertTrue(script.contains("readonly ONNXRUNTIME_VERSION=\"1.24.4\""))
+        XCTAssertFalse(script.contains("SHERPA_ONNX_VERSION:-latest"))
+        XCTAssertTrue(script.contains("verify_sha256"))
+        XCTAssertTrue(script.contains("DEFAULT_XCFW_SHA256"))
+        XCTAssertTrue(script.contains("DEFAULT_ORT_SHA256"))
+        XCTAssertTrue(script.contains("DEFAULT_WRAPPER_SHA256"))
+        XCTAssertTrue(script.contains("COMPILED_WRAPPER_SWIFT"))
+        XCTAssertTrue(script.contains("onnxruntime_install_is_valid"))
+        XCTAssertTrue(script.contains("The file was not installed."))
+        XCTAssertTrue(project.contains("libonnxruntime.1.24.4.dylib"))
+    }
+
+    func testLocalCLTBuildStaysOfflineAndHandlesAdHocLibraryValidation() throws {
+        let root = repositoryRoot()
+        let script = try read("scripts/build_local_clt.sh", from: root)
+        let releaseEntitlements = try read("MeetMemo/MeetMemo.entitlements", from: root)
+
+        XCTAssertTrue(script.contains("swiftc \\"))
+        XCTAssertTrue(script.contains("-target arm64-apple-macosx15.5"))
+        XCTAssertTrue(script.contains("codesign --force --sign - \"${FRAMEWORKS_PATH}/${ONNXRUNTIME_NAME}\""))
+        XCTAssertTrue(script.contains("cp \"$SOURCE_ENTITLEMENTS\" \"$LOCAL_ENTITLEMENTS\""))
+        XCTAssertTrue(script.contains("Add :com.apple.security.cs.disable-library-validation bool true"))
+        XCTAssertTrue(script.contains("--entitlements \"$LOCAL_ENTITLEMENTS\""))
+        XCTAssertTrue(script.contains("codesign --verify --deep --strict"))
+        XCTAssertTrue(script.contains("codesign --display --entitlements \"$SIGNED_ENTITLEMENTS\""))
+        XCTAssertTrue(script.contains("Print :com.apple.security.cs.disable-library-validation"))
+        XCTAssertFalse(releaseEntitlements.contains("com.apple.security.cs.disable-library-validation"))
+        XCTAssertFalse(script.contains("curl "))
+        XCTAssertFalse(script.contains("gh "))
+        XCTAssertFalse(script.contains("git push"))
+    }
+
     func testAudioImportFlowKeepsFinalizationAndCancellationGuards() throws {
         let root = repositoryRoot()
         let transcriber = try read("MeetMemo/Services/AudioFileTranscriber.swift", from: root)
@@ -42,11 +80,13 @@ final class ProjectHygieneTests: XCTestCase {
         XCTAssertTrue(viewModel.contains("try Task.checkCancellation()"))
     }
 
-    func testMeetingResumeKeepsSystemAudioRecoveryPaths() throws {
+    func testSystemAudioUsesGlobalTapAndBuffersColdStartAudio() throws {
         let audioManager = try read("MeetMemo/Managers/AudioManager.swift", from: repositoryRoot())
 
-        XCTAssertTrue(audioManager.contains("scheduleSystemAudioTapRetry(sessionToken: activeSessionToken)"))
-        XCTAssertFalse(audioManager.contains("objectID.readProcessIsRunning(),"))
+        XCTAssertTrue(audioManager.contains("TapTarget.systemAudio(processObjectIDs: [])"))
+        XCTAssertFalse(audioManager.contains("restartSystemAudioTapIfNeeded"))
+        XCTAssertFalse(audioManager.contains("Task.sleep(for: .milliseconds(800))"))
+        XCTAssertTrue(audioManager.contains("bufferPendingSystemAudio(data)"))
         XCTAssertTrue(audioManager.contains("systemSTTConnectingSessionID = sessionToken"))
         XCTAssertTrue(audioManager.contains("connectSTTProvider(\n                    for: .system,\n                    offsetMilliseconds: offset,\n                    sessionToken: sessionToken"))
     }
@@ -61,6 +101,17 @@ final class ProjectHygieneTests: XCTestCase {
         }
 
         XCTAssertLessThan(disconnectRange.lowerBound, stopDoneRange.lowerBound)
+    }
+
+    func testMeetingLogsDoNotExposeUserContentOrModelResponse() throws {
+        let root = repositoryRoot()
+        let viewModel = try read("MeetMemo/ViewModels/MeetingViewModel.swift", from: root)
+        let extractor = try read("MeetMemo/Services/MeetingStructuredExtractor.swift", from: root)
+
+        XCTAssertFalse(viewModel.contains("formattedMeetingContext.prefix"))
+        XCTAssertFalse(extractor.contains("Structured extraction response prefix"))
+        XCTAssertFalse(extractor.contains("String(cleaned.prefix"))
+        XCTAssertFalse(extractor.contains("decode failed: \\(error)"))
     }
 
     func testAppSourcesAvoidCrashOnlyShortcutsOutsideGeneratedBridge() throws {

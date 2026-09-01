@@ -22,6 +22,8 @@ struct ContentView: View {
     }
 }
 
-#Preview {
-    ContentView()
-}
+#if canImport(PreviewsMacros)
+    #Preview {
+        ContentView()
+    }
+#endif

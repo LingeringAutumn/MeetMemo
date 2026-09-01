@@ -62,6 +62,24 @@ final class AudioProcessController {
 
     private var cancellables = Set<AnyCancellable>()
 
+    /// Resolves the Core Audio process object for the supplied BSD process id.
+    ///
+    /// A global process tap includes every audio-producing process by default.  Callers use
+    /// this helper to exclude MeetMemo itself without rebuilding the tap whenever some other
+    /// application's process list changes.  A process that has not created a Core Audio
+    /// object yet simply has nothing to exclude.
+    nonisolated static func audioProcessObjectID(for processID: pid_t) -> AudioObjectID? {
+        guard let objectID = try? AudioObjectID.translatePIDToProcessObjectID(pid: processID),
+              objectID.isValid else {
+            return nil
+        }
+        return objectID
+    }
+
+    nonisolated static var currentProcessAudioObjectID: AudioObjectID? {
+        audioProcessObjectID(for: ProcessInfo.processInfo.processIdentifier)
+    }
+
     func activate() {
         logger.debug(#function)
 
