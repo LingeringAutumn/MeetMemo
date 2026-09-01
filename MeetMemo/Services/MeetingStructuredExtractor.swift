@@ -199,8 +199,8 @@ AI 会议纪要（仅用于快速定位重点，不可作为事实依据）：
         do {
             raw = try decoder.decode(RawStructuredSummary.self, from: data)
         } catch {
-            print("⚠️ Structured extraction decode failed: \(error)")
-            print("⚠️ Structured extraction response prefix: \(String(cleaned.prefix(800)))")
+            print("⚠️ Structured extraction decode failed")
+            print("⚠️ Structured extraction response length: \(cleaned.count) characters")
             throw StructuredExtractionError.invalidResponse
         }
 

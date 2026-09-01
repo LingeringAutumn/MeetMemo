@@ -109,7 +109,9 @@ struct TemplateListView: View {
     }
 }
 
-#Preview {
-    TemplateListView()
-        .environmentObject(LanguageManager.shared)
-}
+#if canImport(PreviewsMacros)
+    #Preview {
+        TemplateListView()
+            .environmentObject(LanguageManager.shared)
+    }
+#endif

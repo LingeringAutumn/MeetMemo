@@ -343,8 +343,10 @@ struct PermissionRow: View {
     }
 }
 
-#Preview {
-    OnboardingView(settingsViewModel: SettingsViewModel())
-        .environmentObject(LanguageManager.shared)
-        .frame(width: 600, height: 700)
-}
+#if canImport(PreviewsMacros)
+    #Preview {
+        OnboardingView(settingsViewModel: SettingsViewModel())
+            .environmentObject(LanguageManager.shared)
+            .frame(width: 600, height: 700)
+    }
+#endif

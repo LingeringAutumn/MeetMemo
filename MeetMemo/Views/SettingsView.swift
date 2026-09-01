@@ -1052,9 +1052,11 @@ private enum SettingsSection: String, CaseIterable, Identifiable {
     }
 }
 
-#Preview {
-    NavigationStack {
-        SettingsView(viewModel: SettingsViewModel())
-            .environmentObject(LanguageManager.shared)
+#if canImport(PreviewsMacros)
+    #Preview {
+        NavigationStack {
+            SettingsView(viewModel: SettingsViewModel())
+                .environmentObject(LanguageManager.shared)
+        }
     }
-}
+#endif

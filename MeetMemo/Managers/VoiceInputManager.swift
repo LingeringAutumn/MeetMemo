@@ -22,12 +22,15 @@ final class VoiceInputManager: NSObject, ObservableObject {
     private var audioPipeline: AudioProcessingPipeline?
     private var provider: STTProvider?
     private var providerConnectTask: Task<Void, Never>?
+    private var audioDrainTask: Task<Void, Never>?
+    private var finalizationTask: Task<Void, Never>?
     private var maxListeningTask: Task<Void, Never>?
     private var transcriptParts: [String] = []
     private var receivedFinalTranscriptKeys = Set<FinalTranscriptKey>()
     private var pendingAudioChunks: [Data] = []
     private var pendingAudioByteCount = 0
     private var sessionID = UUID()
+    private var finalizingSessionID: UUID?
     private let finalFlushTimeout = VoiceInputTiming.finalFlushTimeout
     // 在 provider 连接（含首次模型加载）期间缓冲麦克风音频，避免冷启动吃掉开头几秒。
     private let maxPendingAudioBytes = VoiceInputTiming.maxPendingAudioBytes
@@ -55,7 +58,10 @@ final class VoiceInputManager: NSObject, ObservableObject {
     func start() {
         guard state == .idle else { return }
 
-        guard !RecordingSessionManager.shared.isRecording else {
+        let recordingSession = RecordingSessionManager.shared
+        guard recordingSession.activeMeetingId == nil,
+              !recordingSession.isRecording,
+              !recordingSession.isStoppingRecording else {
             fail(LanguageManager.shared.t(
                 "会议录音中暂不能启动语音输入。",
                 "Voice input cannot start while meeting recording is active."
@@ -82,6 +88,9 @@ final class VoiceInputManager: NSObject, ObservableObject {
         receivedFinalTranscriptKeys.removeAll()
         pendingAudioChunks.removeAll()
         pendingAudioByteCount = 0
+        finalizingSessionID = nil
+        finalizationTask?.cancel()
+        finalizationTask = nil
         errorMessage = nil
         audioLevel = 0
         state = .listening
@@ -108,7 +117,7 @@ final class VoiceInputManager: NSObject, ObservableObject {
         maxListeningTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(VoiceInputTiming.maxListeningDuration))
             guard !Task.isCancelled else { return }
-            await self?.handleMaxListeningReached(sessionID: guardedSessionID)
+            self?.handleMaxListeningReached(sessionID: guardedSessionID)
         }
     }
 
@@ -126,21 +135,25 @@ final class VoiceInputManager: NSObject, ObservableObject {
         state = .transcribing
         VoiceInputFloatingWindowManager.shared.showTranscribing()
 
-        cleanupAudioEngine()
-        audioPipeline?.stop()
+        let stoppedPipeline = audioPipeline
         audioPipeline = nil
-
-        guard let stoppedProvider = provider else {
-            if providerConnectTask == nil {
-                Task { @MainActor [weak self] in
-                    guard let self, self.sessionID == stoppedSessionID else { return }
-                    await self.finishAndInsert()
-                }
+        cleanupAudioEngine()
+        audioDrainTask?.cancel()
+        audioDrainTask = Task { @MainActor [weak self] in
+            if let stoppedPipeline {
+                await stoppedPipeline.drainAndStop()
             }
-            return
-        }
+            guard let self,
+                  self.sessionID == stoppedSessionID,
+                  self.state == .transcribing else { return }
+            self.audioDrainTask = nil
 
-        finalizeAndInsert(provider: stoppedProvider, sessionID: stoppedSessionID)
+            if let stoppedProvider = self.provider {
+                self.finalizeAndInsert(provider: stoppedProvider, sessionID: stoppedSessionID)
+            } else if self.providerConnectTask == nil {
+                await self.finishAndInsert()
+            }
+        }
     }
 
     private func connectProvider(sessionID: UUID) async {
@@ -148,9 +161,12 @@ final class VoiceInputManager: NSObject, ObservableObject {
             try await ensureActiveEngineReady()
             guard self.sessionID == sessionID, state == .listening || state == .transcribing else { return }
 
-            let connectedProvider = try await Task.detached(priority: .userInitiated) {
-                try await Self.makeConnectedProviderOffMain(sessionID: sessionID)
-            }.value
+            // A nonisolated async function runs on the generic executor, so no unstructured
+            // detached child is needed. The Sendable transfer box carries exclusive ownership
+            // back to MainActor and parent cancellation remains structured.
+            let transferredProvider = try await Self.makeConnectedProviderOffMain(sessionID: sessionID)
+            try Task.checkCancellation()
+            let connectedProvider = transferredProvider.provider
             guard self.sessionID == sessionID, state == .listening || state == .transcribing else {
                 connectedProvider.disconnect()
                 return
@@ -160,6 +176,9 @@ final class VoiceInputManager: NSObject, ObservableObject {
             flushPendingAudio(to: connectedProvider)
 
             if state == .transcribing {
+                if let audioDrainTask {
+                    await audioDrainTask.value
+                }
                 finalizeAndInsert(provider: connectedProvider, sessionID: sessionID)
             }
         } catch {
@@ -214,6 +233,10 @@ final class VoiceInputManager: NSObject, ObservableObject {
         sessionID = UUID()
         providerConnectTask?.cancel()
         providerConnectTask = nil
+        audioDrainTask?.cancel()
+        audioDrainTask = nil
+        finalizationTask?.cancel()
+        finalizationTask = nil
         maxListeningTask?.cancel()
         maxListeningTask = nil
         cleanupAudioEngine()
@@ -223,6 +246,7 @@ final class VoiceInputManager: NSObject, ObservableObject {
         provider = nil
         transcriptParts.removeAll()
         receivedFinalTranscriptKeys.removeAll()
+        finalizingSessionID = nil
         pendingAudioChunks.removeAll(keepingCapacity: false)
         pendingAudioByteCount = 0
         audioLevel = 0
@@ -248,8 +272,10 @@ final class VoiceInputManager: NSObject, ObservableObject {
             inputFormat: inputFormat,
             targetFormat: targetFormat,
             onAudioData: { [weak self] data, _ in
-                Task { @MainActor [weak self] in
-                    guard let self, self.sessionID == sessionID, self.state == .listening else { return }
+                DispatchQueue.main.async { [weak self] in
+                    guard let self,
+                          self.sessionID == sessionID,
+                          self.state == .listening || self.state == .transcribing else { return }
                     if let provider = self.provider {
                         provider.sendAudio(data)
                     } else {
@@ -258,7 +284,7 @@ final class VoiceInputManager: NSObject, ObservableObject {
                 }
             },
             onAudioLevel: { [weak self] level, _ in
-                Task { @MainActor [weak self] in
+                DispatchQueue.main.async { [weak self] in
                     guard let self, self.sessionID == sessionID, self.state == .listening else { return }
                     self.audioLevel = level
                     VoiceInputFloatingWindowManager.shared.updateAudioLevel(level)
@@ -269,8 +295,8 @@ final class VoiceInputManager: NSObject, ObservableObject {
         }
 
         audioPipeline = pipeline
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
-            self?.audioPipeline?.enqueue(buffer)
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [pipeline] buffer, _ in
+            pipeline.enqueue(buffer)
         }
         audioEngine.prepare()
         try audioEngine.start()
@@ -294,25 +320,37 @@ final class VoiceInputManager: NSObject, ObservableObject {
     }
 
     private func finalizeAndInsert(provider stoppedProvider: STTProvider, sessionID stoppedSessionID: UUID) {
+        guard finalizingSessionID != stoppedSessionID else { return }
+        finalizingSessionID = stoppedSessionID
         if trailingSilenceBytes > 0 {
             stoppedProvider.sendAudio(Data(repeating: 0, count: trailingSilenceBytes))
         }
         stoppedProvider.sendLastAudio()
 
-        Task { @MainActor [weak self] in
+        finalizationTask?.cancel()
+        finalizationTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            _ = await stoppedProvider.awaitPendingFinalization(timeout: self.finalFlushTimeout)
-            try? await Task.sleep(for: VoiceInputTiming.postFinalizationDrainDelay)
-            guard self.sessionID == stoppedSessionID else { return }
+            let status = await stoppedProvider.awaitPendingFinalization(timeout: self.finalFlushTimeout)
+            await self.awaitMainQueueBarrier()
+            guard !Task.isCancelled,
+                  self.sessionID == stoppedSessionID,
+                  self.state == .transcribing,
+                  self.finalizingSessionID == stoppedSessionID else { return }
+            if status.mayHaveMissedTailAudio {
+                self.errorMessage = LanguageManager.shared.t(
+                    "语音识别收尾超时，最后几个字可能未完成。",
+                    "Voice recognition finalization timed out; the last few words may be missing."
+                )
+            }
             await self.finishAndInsert()
         }
     }
 
-    private nonisolated static func makeConnectedProviderOffMain(sessionID: UUID) async throws -> STTProvider {
+    private nonisolated static func makeConnectedProviderOffMain(sessionID: UUID) async throws -> TransferredSTTProvider {
         let engine = UserDefaultsManager.shared.sttEngine
         let provider = factory(for: engine).makeProvider()
         provider.onTranscriptUpdate = { update in
-            Task { @MainActor in
+            DispatchQueue.main.async {
                 let manager = VoiceInputManager.shared
                 guard manager.sessionID == sessionID else { return }
                 guard update.isFinal else { return }
@@ -323,15 +361,22 @@ final class VoiceInputManager: NSObject, ObservableObject {
             }
         }
         provider.onError = { message in
-            Task { @MainActor in
+            DispatchQueue.main.async {
                 let manager = VoiceInputManager.shared
                 guard manager.sessionID == sessionID else { return }
                 manager.fail(message)
             }
         }
         provider.onTranscriptCorrection = nil
-        try await provider.connect(config: APIKeyValidator.shared.currentSTTConfig())
-        return provider
+        do {
+            try Task.checkCancellation()
+            try await provider.connect(config: APIKeyValidator.shared.currentSTTConfig())
+            try Task.checkCancellation()
+            return TransferredSTTProvider(provider)
+        } catch {
+            provider.disconnect()
+            throw error
+        }
     }
 
     private func finishAndInsert() async {
@@ -343,6 +388,9 @@ final class VoiceInputManager: NSObject, ObservableObject {
 
         provider?.disconnect()
         provider = nil
+        audioDrainTask = nil
+        finalizationTask = nil
+        finalizingSessionID = nil
 
         guard !finalText.isEmpty else {
             fail(LanguageManager.shared.t("没有识别到可插入的内容。", "No text was recognized to insert."))
@@ -369,6 +417,10 @@ final class VoiceInputManager: NSObject, ObservableObject {
         errorMessage = message
         providerConnectTask?.cancel()
         providerConnectTask = nil
+        audioDrainTask?.cancel()
+        audioDrainTask = nil
+        finalizationTask?.cancel()
+        finalizationTask = nil
         maxListeningTask?.cancel()
         maxListeningTask = nil
         cleanupAudioEngine()
@@ -378,6 +430,7 @@ final class VoiceInputManager: NSObject, ObservableObject {
         provider = nil
         transcriptParts.removeAll()
         receivedFinalTranscriptKeys.removeAll()
+        finalizingSessionID = nil
         pendingAudioChunks.removeAll(keepingCapacity: false)
         pendingAudioByteCount = 0
         audioLevel = 0
@@ -392,6 +445,14 @@ final class VoiceInputManager: NSObject, ObservableObject {
         audioEngine.inputNode.removeTap(onBus: 0)
         audioEngine.reset()
         audioEngine = AVAudioEngine()
+    }
+
+    private func awaitMainQueueBarrier() async {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async {
+                continuation.resume()
+            }
+        }
     }
 
     private func acceptFinalTranscript(text: String, update: STTTranscriptUpdate) -> Bool {
@@ -415,6 +476,17 @@ final class VoiceInputManager: NSObject, ObservableObject {
         }
     }
 
+}
+
+/// The provider is fully constructed on a generic executor and has no concurrent consumer
+/// until this box is opened on MainActor. This documents that one-time ownership transfer
+/// without declaring every mutable STT implementation universally Sendable.
+private final class TransferredSTTProvider: @unchecked Sendable {
+    let provider: STTProvider
+
+    init(_ provider: STTProvider) {
+        self.provider = provider
+    }
 }
 
 private struct FinalTranscriptKey: Hashable {

@@ -5,6 +5,8 @@ import AVFoundation
 
 enum TapTarget {
     case singleProcess(AudioProcess)
+    /// Legacy associated values are retained so existing call sites keep compiling.  System
+    /// capture itself is global and deliberately ignores this snapshot; see `tapMixPolicy`.
     case systemAudio(processObjectIDs: [AudioObjectID])
 
     var displayName: String {
@@ -41,6 +43,22 @@ enum TapTarget {
 final class ProcessTap {
 
     typealias InvalidationHandler = (ProcessTap) -> Void
+
+    enum InvalidationReason: Equatable {
+        /// The owner is stopping, restarting, or otherwise deliberately tearing down the tap.
+        case requested
+        /// Reserved for a genuine Core Audio/device failure signal.
+        case unexpected
+
+        var notifiesHandler: Bool {
+            self == .unexpected
+        }
+    }
+
+    enum TapMixPolicy: Equatable {
+        case includeProcesses([AudioObjectID])
+        case globalExcludingProcesses([AudioObjectID])
+    }
 
     let target: TapTarget
     let muteWhenRunning: Bool
@@ -88,13 +106,15 @@ final class ProcessTap {
         }
     }
 
-    func invalidate() {
+    /// Tears down the tap.  Owner-requested teardown must not masquerade as an unexpected
+    /// Core Audio failure: doing so used to make normal stop/degrade paths schedule a restart.
+    func invalidate(reason: InvalidationReason = .requested) {
         guard activated else { return }
-        defer { activated = false }
+        activated = false
 
         logger.debug(#function)
 
-        invalidationHandler?(self)
+        let handler = invalidationHandler
         self.invalidationHandler = nil
 
         if aggregateDeviceID.isValid {
@@ -127,22 +147,27 @@ final class ProcessTap {
             }
             self.processTapID = .unknown
         }
+
+        if reason.notifiesHandler {
+            handler?(self)
+        }
     }
 
     private func prepare() throws {
         errorMessage = nil
 
+        let policy = Self.tapMixPolicy(
+            for: target,
+            currentProcessObjectID: AudioProcessController.currentProcessAudioObjectID
+        )
         let tapDescription: CATapDescription
-        switch self.target {
-        case .singleProcess(let process):
-            tapDescription = CATapDescription(stereoMixdownOfProcesses: [process.objectID])
-            logger.debug("Configuring tap for single process objectID: \(process.objectID)")
-        case .systemAudio(let processObjectIDs):
-            if processObjectIDs.isEmpty {
-                logger.warning("System audio tap configured with an empty list of processObjectIDs. This might not capture any audio or behave unexpectedly.")
-            }
+        switch policy {
+        case .includeProcesses(let processObjectIDs):
             tapDescription = CATapDescription(stereoMixdownOfProcesses: processObjectIDs)
-            logger.debug("Configuring tap for system audio output using \(processObjectIDs.count) explicit processes.")
+            logger.debug("Configuring tap for \(processObjectIDs.count) explicit process(es).")
+        case .globalExcludingProcesses(let processObjectIDs):
+            tapDescription = CATapDescription(stereoGlobalTapButExcludeProcesses: processObjectIDs)
+            logger.debug("Configuring global system audio tap excluding \(processObjectIDs.count) process(es).")
         }
         
         tapDescription.uuid = UUID()
@@ -278,6 +303,22 @@ final class ProcessTap {
     }
 
     deinit { invalidate() }
+
+    /// Pure policy used by `prepare()` and unit tests.  The legacy system-audio process list is
+    /// intentionally ignored: a global tap automatically follows applications that begin or
+    /// stop producing audio after recording starts.
+    static func tapMixPolicy(
+        for target: TapTarget,
+        currentProcessObjectID: AudioObjectID?
+    ) -> TapMixPolicy {
+        switch target {
+        case .singleProcess(let process):
+            return .includeProcesses([process.objectID])
+        case .systemAudio:
+            let exclusions = currentProcessObjectID.flatMap { $0.isValid ? [$0] : nil } ?? []
+            return .globalExcludingProcesses(exclusions)
+        }
+    }
 
 }
 

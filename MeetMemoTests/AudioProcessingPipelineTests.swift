@@ -78,6 +78,159 @@ final class AudioProcessingPipelineTests: XCTestCase {
 
         wait(for: [unexpectedAudio], timeout: 0.2)
     }
+
+    func testSilentSystemBufferIsForwardedWithoutCompressingTimeline() async throws {
+        let format = try XCTUnwrap(AVAudioFormat(
+            commonFormat: .pcmFormatInt16,
+            sampleRate: 16_000,
+            channels: 1,
+            interleaved: false
+        ))
+        let inputBuffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 320))
+        inputBuffer.frameLength = 320
+        memset(inputBuffer.int16ChannelData?[0], 0, 320 * MemoryLayout<Int16>.size)
+
+        let output = CapturedPipelineOutput()
+        let pipeline = try XCTUnwrap(AudioProcessingPipeline(
+            source: .system,
+            inputFormat: format,
+            targetFormat: format,
+            onAudioData: { data, _ in output.appendData(data) },
+            onAudioLevel: { level, _ in output.setLevel(level) }
+        ))
+
+        pipeline.enqueue(inputBuffer)
+        await pipeline.drainAndStop()
+
+        XCTAssertEqual(output.data.count, 640)
+        XCTAssertEqual(output.level, 0, accuracy: 0.000_001)
+    }
+
+    func testDrainAndStopDeliversEveryReservedBufferBeforeReturning() async throws {
+        let format = try XCTUnwrap(AVAudioFormat(
+            commonFormat: .pcmFormatInt16,
+            sampleRate: 16_000,
+            channels: 1,
+            interleaved: false
+        ))
+        let inputBuffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 160))
+        inputBuffer.frameLength = 160
+        inputBuffer.int16ChannelData?[0][0] = 1_000
+
+        let output = CapturedPipelineOutput()
+        let pipeline = try XCTUnwrap(AudioProcessingPipeline(
+            source: .mic,
+            inputFormat: format,
+            targetFormat: format,
+            onAudioData: { data, _ in output.appendData(data) },
+            onAudioLevel: { _, _ in }
+        ))
+
+        pipeline.enqueue(inputBuffer)
+        pipeline.enqueue(inputBuffer)
+        await pipeline.drainAndStop()
+
+        XCTAssertEqual(output.data.count, 640)
+    }
+
+    func testConcurrentDrainCallersWaitForTheSameFlushBarrier() async throws {
+        let format = try XCTUnwrap(AVAudioFormat(
+            commonFormat: .pcmFormatInt16,
+            sampleRate: 16_000,
+            channels: 1,
+            interleaved: false
+        ))
+        let inputBuffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 160))
+        inputBuffer.frameLength = 160
+
+        let processingStarted = expectation(description: "pipeline callback started")
+        let releaseProcessing = DispatchSemaphore(value: 0)
+        let output = CapturedPipelineOutput()
+        let pipeline = try XCTUnwrap(AudioProcessingPipeline(
+            source: .mic,
+            inputFormat: format,
+            targetFormat: format,
+            onAudioData: { data, _ in
+                processingStarted.fulfill()
+                _ = releaseProcessing.wait(timeout: .now() + 1)
+                output.appendData(data)
+            },
+            onAudioLevel: { _, _ in }
+        ))
+
+        pipeline.enqueue(inputBuffer)
+        await fulfillment(of: [processingStarted], timeout: 1)
+
+        let firstDrain = Task { await pipeline.drainAndStop() }
+        let secondDrain = Task { await pipeline.drainAndStop() }
+        releaseProcessing.signal()
+
+        await firstDrain.value
+        await secondDrain.value
+        XCTAssertEqual(output.data.count, 320)
+    }
+
+    func testDrainFlushesResamplerTailFrames() async throws {
+        let inputFormat = try XCTUnwrap(AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: 48_000,
+            channels: 1,
+            interleaved: false
+        ))
+        let outputFormat = try XCTUnwrap(AVAudioFormat(
+            commonFormat: .pcmFormatInt16,
+            sampleRate: 16_000,
+            channels: 1,
+            interleaved: false
+        ))
+        let inputBuffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: inputFormat, frameCapacity: 1_024))
+        inputBuffer.frameLength = 1_024
+        for index in 0..<Int(inputBuffer.frameLength) {
+            inputBuffer.floatChannelData?[0][index] = 0.25
+        }
+
+        let output = CapturedPipelineOutput()
+        let pipeline = try XCTUnwrap(AudioProcessingPipeline(
+            source: .system,
+            inputFormat: inputFormat,
+            targetFormat: outputFormat,
+            onAudioData: { data, _ in output.appendData(data) },
+            onAudioLevel: { _, _ in }
+        ))
+
+        pipeline.enqueue(inputBuffer)
+        await pipeline.drainAndStop()
+
+        let outputFrameCount = output.data.count / MemoryLayout<Int16>.size
+        XCTAssertTrue((340...342).contains(outputFrameCount), "Unexpected resampled frame count: \(outputFrameCount)")
+    }
+
+    func testBackpressureReplacesDroppedAudioWithEqualDurationSilence() async throws {
+        let format = try XCTUnwrap(AVAudioFormat(
+            commonFormat: .pcmFormatInt16,
+            sampleRate: 16_000,
+            channels: 1,
+            interleaved: false
+        ))
+        let inputBuffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 320))
+        inputBuffer.frameLength = 320
+        inputBuffer.int16ChannelData?[0][0] = 2_000
+
+        let output = CapturedPipelineOutput()
+        let pipeline = try XCTUnwrap(AudioProcessingPipeline(
+            source: .system,
+            inputFormat: format,
+            targetFormat: format,
+            maxPendingBuffers: 0,
+            onAudioData: { data, _ in output.appendData(data) },
+            onAudioLevel: { _, _ in }
+        ))
+
+        pipeline.enqueue(inputBuffer)
+        await pipeline.drainAndStop()
+
+        XCTAssertEqual(output.data, Data(repeating: 0, count: 640))
+    }
 }
 
 private final class CapturedPipelineOutput: @unchecked Sendable {
@@ -96,6 +249,12 @@ private final class CapturedPipelineOutput: @unchecked Sendable {
     func setData(_ data: Data) {
         lock.withLock {
             capturedData = data
+        }
+    }
+
+    func appendData(_ data: Data) {
+        lock.withLock {
+            capturedData.append(data)
         }
     }
 
