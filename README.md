@@ -7,10 +7,15 @@
   <p align="center">
     免费、源码公开、运行在本地的 macOS AI 会议纪要助手
     <br />
-    <a href="https://github.com/abcwyc/MeetMemo/releases">下载 macOS 15.5+ 版本</a>
+    <a href="https://github.com/abcwyc/MeetMemo/releases">下载上游官方 macOS 15.5+ 版本</a>
   </p>
 
 </div>
+
+> [!IMPORTANT]
+> 本仓库是基于 [abcwyc/MeetMemo](https://github.com/abcwyc/MeetMemo) 的非官方修改版本，主要改进双路音频时间轴、录音收尾、识别器生命周期和本地构建流程。
+> 项目继续遵循 PolyForm Noncommercial License 1.0.0，仅限非商业用途；原始版权声明和许可证文本已保留。
+> 当前仓库暂未发布独立安装包，下面的下载链接指向上游官方版本，不包含本仓库的修改。
 
 ## 简介
 
@@ -72,7 +77,7 @@ MeetMemo ：
 
 ### 1. 安装并打开
 
-下载最新的 [MeetMemo.dmg](https://github.com/abcwyc/MeetMemo/releases)，安装后打开应用。
+下载上游官方的 [MeetMemo.dmg](https://github.com/abcwyc/MeetMemo/releases)，安装后打开应用。该安装包不包含本仓库的修改。
 
 首次启动会进入引导页，需要完成权限和服务配置。你也可以稍后在「设置」中重新配置。
 
@@ -213,7 +218,7 @@ chmod +x scripts/update_version.sh scripts/build_release.sh
 
 ### 创建 GitHub Release
 
-1. 打开 [GitHub Releases](https://github.com/abcwyc/MeetMemo/releases)。
+1. 打开本仓库的 [GitHub Releases](https://github.com/LingeringAutumn/MeetMemo/releases)。
 2. 创建新 release，tag 使用 `v版本号`，例如 `v0.4`。
 3. 上传 `releases/` 目录下生成的 DMG。
 4. 生成并补充 release notes。
