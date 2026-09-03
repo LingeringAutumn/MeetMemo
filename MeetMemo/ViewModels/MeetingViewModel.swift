@@ -5,9 +5,25 @@ import Combine
 // Add notification name for meeting saved events
 extension Notification.Name {
     static let meetingSaved = Notification.Name("MeetingSaved")
+    /// Posted after a post-recording engine atomically replaces a recording range.
+    /// Detail views must treat its transcript as authoritative even when unrelated
+    /// title/context edits are still waiting for the normal debounce save.
+    static let meetingAccurateTranscriptSaved = Notification.Name("MeetingAccurateTranscriptSaved")
     static let meetingWillDelete = Notification.Name("MeetingWillDelete")
     static let meetingDeleted = Notification.Name("MeetingDeleted")
     static let meetingRenamed = Notification.Name("MeetingRenamed")
+}
+
+/// Carries an authoritative post-recording transcript back into any open detail view.
+/// When the user has unrelated unsaved edits, keep those fields while replacing only
+/// transcript-owned state. This prevents a later debounced save from resurrecting the
+/// live draft chunks that the accurate pass just superseded on disk.
+struct MeetingAccurateTranscriptUpdate {
+    let persistedMeeting: Meeting
+
+    func merging(into currentMeeting: Meeting) -> Meeting? {
+        currentMeeting.adoptingAuthoritativeTranscript(from: persistedMeeting)
+    }
 }
 
 enum AINotesSubTab {
@@ -65,7 +81,8 @@ struct MeetingRecordingStartRequest: Equatable {
         isDeleted: Bool,
         activeMeetingID: UUID?,
         isRecording: Bool,
-        isStopping: Bool
+        isStopping: Bool,
+        isRecoveringRecordings: Bool
     ) -> Bool {
         isCurrent(
             currentMeetingID: currentMeetingID,
@@ -74,6 +91,7 @@ struct MeetingRecordingStartRequest: Equatable {
         ) && activeMeetingID == nil
             && !isRecording
             && !isStopping
+            && !isRecoveringRecordings
     }
 }
 
@@ -228,11 +246,37 @@ class MeetingViewModel: ObservableObject {
                 guard let self,
                       savedMeeting.id == self.meeting.id,
                       !self.recordingSessionManager.isRecordingMeeting(savedMeeting.id),
-                      !self.hasLocalUnsavedChanges else {
+                      !self.hasLocalUnsavedChanges,
+                      savedMeeting != self.meeting else {
                     return
                 }
 
+                self.isApplyingLoadedMeeting = true
                 self.meeting = savedMeeting
+                self.isApplyingLoadedMeeting = false
+                self.hasLocalUnsavedChanges = false
+                self.refreshTranscriptDisplayChunks()
+                self.refreshToolbarSnapshot()
+            }
+            .store(in: &cancellables)
+
+        NotificationCenter.default.publisher(for: .meetingAccurateTranscriptSaved)
+            .compactMap { $0.object as? MeetingAccurateTranscriptUpdate }
+            .sink { [weak self] update in
+                guard let self,
+                      update.persistedMeeting.id == self.meeting.id,
+                      !self.recordingSessionManager.isRecordingMeeting(update.persistedMeeting.id),
+                      let merged = update.merging(into: self.meeting) else {
+                    return
+                }
+
+                // Assigning the authoritative transcript also replaces any already
+                // scheduled debounced $meeting event with this fresh snapshot.
+                let hadLocalUnsavedChanges = self.hasLocalUnsavedChanges
+                self.isApplyingLoadedMeeting = true
+                self.meeting = merged
+                self.isApplyingLoadedMeeting = false
+                self.hasLocalUnsavedChanges = hadLocalUnsavedChanges
                 self.refreshTranscriptDisplayChunks()
                 self.refreshToolbarSnapshot()
             }
@@ -287,6 +331,20 @@ class MeetingViewModel: ObservableObject {
         
 
         
+        // Mark edits immediately. Waiting until the debounce fires leaves a window in
+        // which an external save can overwrite a title/JD change made moments earlier.
+        $meeting
+            .dropFirst()
+            .sink { [weak self] _ in
+                guard let self,
+                      !self.isApplyingLoadedMeeting,
+                      !self.isStreamingGeneratedNotes else {
+                    return
+                }
+                self.hasLocalUnsavedChanges = true
+            }
+            .store(in: &cancellables)
+
         // Auto-save when meeting properties change
         $meeting
             .dropFirst()
@@ -295,8 +353,7 @@ class MeetingViewModel: ObservableObject {
                 guard let self else { return }
                 guard !self.isApplyingLoadedMeeting else { return }
                 guard !self.isStreamingGeneratedNotes else { return }
-
-                self.hasLocalUnsavedChanges = true
+                guard self.hasLocalUnsavedChanges else { return }
 
                 guard self.hasCompletedInitialLoad else { return }
                 print("🔄 Auto-saving meeting: \(meeting.id)")
@@ -505,19 +562,28 @@ class MeetingViewModel: ObservableObject {
 
             print("🔄 Loaded full meeting: \(meetingId)")
             self.isApplyingLoadedMeeting = true
+            // The detached read above can finish after an accurate-transcript
+            // notification has already advanced the in-memory revision. Fold the
+            // returned snapshot through the current value before assigning it so a
+            // slow initial load can never roll the transcript or provenance receipt
+            // back to an older disk snapshot.
+            let transcriptSafeLoaded = savedMeeting.mergingForPersistence(
+                with: self.meeting,
+                preserveMissingFinalChunks: true
+            )
             let isLiveRecording = self.recordingSessionManager.isRecordingMeeting(meetingId)
             if isLiveRecording {
                 // 直播录制中：transcriptChunks 以内存中的活跃片段为准，
                 // 仅从磁盘合并其它持久化字段，避免覆盖最新的 final/interim。
                 var merged = self.hasLocalUnsavedChanges
-                    ? self.mergingLoadedMeeting(savedMeeting, withLocalEditsFrom: self.meeting)
-                    : savedMeeting
+                    ? self.mergingLoadedMeeting(transcriptSafeLoaded, withLocalEditsFrom: self.meeting)
+                    : transcriptSafeLoaded
                 merged.transcriptChunks = self.recordingSessionManager.getTranscriptChunks(for: meetingId)
                 self.meeting = merged
             } else {
                 self.meeting = self.hasLocalUnsavedChanges
-                    ? self.mergingLoadedMeeting(savedMeeting, withLocalEditsFrom: self.meeting)
-                    : savedMeeting
+                    ? self.mergingLoadedMeeting(transcriptSafeLoaded, withLocalEditsFrom: self.meeting)
+                    : transcriptSafeLoaded
             }
             self.isApplyingLoadedMeeting = false
             self.refreshTranscriptDisplayChunks()
@@ -539,8 +605,16 @@ class MeetingViewModel: ObservableObject {
         merged.generatedNotes = local.generatedNotes
         merged.templateId = local.templateId ?? loaded.templateId
 
-        merged.transcriptChunks = local.transcriptChunks
-            .mergingTranscriptCorrections(preservingMissingFinalChunksFrom: loaded.transcriptChunks)
+        let transcriptSafeLocal = local.mergingForPersistence(
+            with: loaded,
+            preserveMissingFinalChunks: true
+        )
+        merged.transcriptChunks = transcriptSafeLocal.transcriptChunks
+        merged.transcriptRevision = transcriptSafeLocal.transcriptRevision
+        merged.accurateTranscriptReceipts = transcriptSafeLocal.accurateTranscriptReceipts
+        merged.transcriptionProvenanceVersion = transcriptSafeLocal.transcriptionProvenanceVersion
+        merged.speakerNameMappings = transcriptSafeLocal.speakerNameMappings
+        merged.dataVersion = max(loaded.dataVersion, local.dataVersion)
 
         return merged
     }
@@ -598,7 +672,8 @@ class MeetingViewModel: ObservableObject {
         guard !isStartingRecording,
               recordingSessionManager.activeMeetingId == nil,
               !recordingSessionManager.isRecording,
-              !recordingSessionManager.isStoppingRecording else {
+              !recordingSessionManager.isStoppingRecording,
+              !recordingSessionManager.isRecoveringRecordings else {
             return
         }
 
@@ -635,7 +710,8 @@ class MeetingViewModel: ObservableObject {
                         isDeleted: self.isDeleted,
                         activeMeetingID: self.recordingSessionManager.activeMeetingId,
                         isRecording: self.recordingSessionManager.isRecording,
-                        isStopping: self.recordingSessionManager.isStoppingRecording
+                        isStopping: self.recordingSessionManager.isStoppingRecording,
+                        isRecoveringRecordings: self.recordingSessionManager.isRecoveringRecordings
                       ) else {
                     self.finishRecordingStart(request, clearStartingState: true)
                     return
@@ -854,14 +930,36 @@ class MeetingViewModel: ObservableObject {
             }
             guard generationCounter == myGeneration else { return }
             isStreamingGeneratedNotes = false
-            savePersistedMeeting(generatedMeeting)
+            var completedMeeting = generatedMeeting
             if meeting.id == meetingId {
-                meeting = generatedMeeting
+                // The note request may have overlapped a more accurate post-recording
+                // transcript or a user edit. Rebase only the fields produced here.
+                completedMeeting = meeting
+                completedMeeting.generatedNotes = generatedMeeting.generatedNotes
+                completedMeeting.oneLiner = generatedMeeting.oneLiner
+                if completedMeeting.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    completedMeeting.title = generatedMeeting.title
+                }
+            }
+            let persistedMeeting = savePersistedMeeting(completedMeeting)
+            if meeting.id == meetingId, let persistedMeeting {
+                applyPersistedMeetingToCurrent(persistedMeeting)
+                selectedTab = .enhancedNotes
+                aiNotesSubTab = .notes
+            } else if meeting.id == meetingId {
+                // Keep the generated content visible and dirty so the existing
+                // debounce retries persistence. Never label an unsaved snapshot as
+                // persisted: that would make a disk-full failure look successful.
+                meeting = completedMeeting
+                hasLocalUnsavedChanges = true
                 refreshToolbarSnapshot()
+                errorMessage = "会议纪要已生成，但保存到本机失败；内容暂留在当前窗口，请检查磁盘空间后再试。"
                 selectedTab = .enhancedNotes
                 aiNotesSubTab = .notes
             }
-            Task { await self.extractStructuredSummary(from: generatedMeeting) }
+            if let persistedMeeting {
+                Task { await self.extractStructuredSummary(from: persistedMeeting) }
+            }
         }
     }
 
@@ -872,20 +970,42 @@ class MeetingViewModel: ObservableObject {
         print("💾 Save result: \(success ? "SUCCESS" : "FAILED")")
         if success {
             hasLocalUnsavedChanges = false
-            NotificationCenter.default.post(name: .meetingSaved, object: meeting)
+            let persistedMeeting = LocalStorageManager.shared.loadMeeting(id: meeting.id) ?? meeting
+            if persistedMeeting != meeting {
+                isApplyingLoadedMeeting = true
+                meeting = persistedMeeting
+                isApplyingLoadedMeeting = false
+                refreshTranscriptDisplayChunks()
+                refreshToolbarSnapshot()
+            }
+            NotificationCenter.default.post(name: .meetingSaved, object: persistedMeeting)
+        } else {
+            hasLocalUnsavedChanges = true
+            errorMessage = "保存会议失败，当前改动尚未写入磁盘；请检查磁盘空间或文件权限。"
         }
     }
 
-    private func savePersistedMeeting(_ meeting: Meeting) {
+    @discardableResult
+    private func savePersistedMeeting(_ meeting: Meeting) -> Meeting? {
         print("💾 Saving background meeting: \(meeting.id)")
         let success = LocalStorageManager.shared.saveMeeting(meeting)
         print("💾 Background save result: \(success ? "SUCCESS" : "FAILED")")
         if success {
-            if self.meeting.id == meeting.id {
-                hasLocalUnsavedChanges = false
-            }
-            NotificationCenter.default.post(name: .meetingSaved, object: meeting)
+            let persistedMeeting = LocalStorageManager.shared.loadMeeting(id: meeting.id) ?? meeting
+            NotificationCenter.default.post(name: .meetingSaved, object: persistedMeeting)
+            return persistedMeeting
         }
+        return nil
+    }
+
+    private func applyPersistedMeetingToCurrent(_ persistedMeeting: Meeting) {
+        guard meeting.id == persistedMeeting.id else { return }
+        isApplyingLoadedMeeting = true
+        meeting = persistedMeeting
+        isApplyingLoadedMeeting = false
+        hasLocalUnsavedChanges = false
+        refreshTranscriptDisplayChunks()
+        refreshToolbarSnapshot()
     }
     
     func copyCurrentTabContent() {
@@ -967,7 +1087,8 @@ class MeetingViewModel: ObservableObject {
 
         do {
             let result = try await MeetingStructuredExtractor.shared.extract(from: snapshot)
-            var updatedMeeting = snapshot
+            let extractionSourceHash = snapshot.structuredSummaryCurrentSourceHash
+            var updatedMeeting = meeting.id == meetingId ? meeting : snapshot
             // Don't overwrite oneLiner with empty — the model occasionally returns ""
             // despite the prompt rule, which would erase the header card entirely.
             // Fall back to the current value, then to the title.
@@ -986,11 +1107,18 @@ class MeetingViewModel: ObservableObject {
             updatedMeeting.openQuestions = result.openQuestions
             updatedMeeting.discussions = result.discussions
             updatedMeeting.milestones = result.milestones
-            updatedMeeting.structuredSummarySourceHash = updatedMeeting.structuredSummaryCurrentSourceHash
+            // Record the transcript actually sent to the extractor. If a precise
+            // transcript arrived while awaiting the model, the result remains visibly stale.
+            updatedMeeting.structuredSummarySourceHash = extractionSourceHash
             updatedMeeting.structuredSummaryGeneratedAt = Date()
-            savePersistedMeeting(updatedMeeting)
-            if meeting.id == meetingId {
+            let persistedMeeting = savePersistedMeeting(updatedMeeting)
+            if meeting.id == meetingId, let persistedMeeting {
+                applyPersistedMeetingToCurrent(persistedMeeting)
+            } else if meeting.id == meetingId {
                 meeting = updatedMeeting
+                hasLocalUnsavedChanges = true
+                refreshToolbarSnapshot()
+                structuredSummaryErrorMessage = "结构化摘要已生成，但保存失败；内容暂留在当前窗口。"
             }
         } catch {
             if meeting.id == meetingId {
@@ -1081,11 +1209,16 @@ class MeetingViewModel: ObservableObject {
 
         do {
             let extractedTasks = try await FollowUpTaskExtractor.shared.extractTasks(from: snapshot)
-            var updatedMeeting = snapshot
+            var updatedMeeting = meeting.id == meetingId ? meeting : snapshot
             mergeExtractedFollowUpTasks(extractedTasks, into: &updatedMeeting)
-            savePersistedMeeting(updatedMeeting)
-            if meeting.id == meetingId {
+            let persistedMeeting = savePersistedMeeting(updatedMeeting)
+            if meeting.id == meetingId, let persistedMeeting {
+                applyPersistedMeetingToCurrent(persistedMeeting)
+            } else if meeting.id == meetingId {
                 meeting = updatedMeeting
+                hasLocalUnsavedChanges = true
+                refreshToolbarSnapshot()
+                errorMessage = "待办已提取，但保存失败；内容暂留在当前窗口。"
             }
         } catch {
             if meeting.id == meetingId {
@@ -1335,6 +1468,7 @@ class MeetingViewModel: ObservableObject {
         }
 
         cancelGeneratingNotes(for: meeting.id)
+        NotificationCenter.default.post(name: .meetingWillDelete, object: meeting)
         saveMeeting()
         
         let success = LocalStorageManager.shared.deleteMeeting(meeting)

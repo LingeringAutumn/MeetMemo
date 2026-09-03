@@ -12,7 +12,8 @@ final class MeetingRecordingStartRequestTests: XCTestCase {
             isDeleted: false,
             activeMeetingID: nil,
             isRecording: false,
-            isStopping: false
+            isStopping: false,
+            isRecoveringRecordings: false
         ))
         XCTAssertFalse(request.canCommit(
             currentMeetingID: UUID(),
@@ -20,7 +21,8 @@ final class MeetingRecordingStartRequestTests: XCTestCase {
             isDeleted: false,
             activeMeetingID: nil,
             isRecording: false,
-            isStopping: false
+            isStopping: false,
+            isRecoveringRecordings: false
         ))
         XCTAssertFalse(request.canCommit(
             currentMeetingID: meetingID,
@@ -28,7 +30,8 @@ final class MeetingRecordingStartRequestTests: XCTestCase {
             isDeleted: false,
             activeMeetingID: nil,
             isRecording: false,
-            isStopping: false
+            isStopping: false,
+            isRecoveringRecordings: false
         ))
     }
 
@@ -42,7 +45,8 @@ final class MeetingRecordingStartRequestTests: XCTestCase {
             isDeleted: true,
             activeMeetingID: nil,
             isRecording: false,
-            isStopping: false
+            isStopping: false,
+            isRecoveringRecordings: false
         ))
         XCTAssertFalse(request.canCommit(
             currentMeetingID: meetingID,
@@ -50,7 +54,8 @@ final class MeetingRecordingStartRequestTests: XCTestCase {
             isDeleted: false,
             activeMeetingID: UUID(),
             isRecording: false,
-            isStopping: false
+            isStopping: false,
+            isRecoveringRecordings: false
         ))
         XCTAssertFalse(request.canCommit(
             currentMeetingID: meetingID,
@@ -58,7 +63,8 @@ final class MeetingRecordingStartRequestTests: XCTestCase {
             isDeleted: false,
             activeMeetingID: nil,
             isRecording: true,
-            isStopping: false
+            isStopping: false,
+            isRecoveringRecordings: false
         ))
         XCTAssertFalse(request.canCommit(
             currentMeetingID: meetingID,
@@ -66,7 +72,23 @@ final class MeetingRecordingStartRequestTests: XCTestCase {
             isDeleted: false,
             activeMeetingID: nil,
             isRecording: false,
-            isStopping: true
+            isStopping: true,
+            isRecoveringRecordings: false
+        ))
+    }
+
+    func testRequestRejectsCommitUntilInterruptedRecordingRecoveryFinishes() {
+        let meetingID = UUID()
+        let request = MeetingRecordingStartRequest(meetingID: meetingID, generation: 1)
+
+        XCTAssertFalse(request.canCommit(
+            currentMeetingID: meetingID,
+            currentGeneration: 1,
+            isDeleted: false,
+            activeMeetingID: nil,
+            isRecording: false,
+            isStopping: false,
+            isRecoveringRecordings: true
         ))
     }
 }

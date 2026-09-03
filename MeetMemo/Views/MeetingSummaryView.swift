@@ -3,6 +3,7 @@ import SwiftUI
 struct MeetingSummaryView: View {
     @ObservedObject var viewModel: MeetingViewModel
     @EnvironmentObject var langMgr: LanguageManager
+    @ObservedObject private var postRecordingTranscription = AliyunPostRecordingTranscriptionService.shared
 
     private var meeting: Meeting { viewModel.meeting }
     private var isExtracting: Bool { viewModel.isExtractingStructuredSummary }
@@ -86,30 +87,71 @@ struct MeetingSummaryView: View {
 
     @ViewBuilder
     private var statusSection: some View {
-        if isExtracting {
-            SummaryExtractingBanner(
-                title: langMgr.t("正在提取结构化内容", "Extracting structured content"),
-                message: langMgr.t(
-                    "正在分析转录原文，完成后会更新议题、决策、风险、待确认问题和待办。",
-                    "Analyzing the transcript. Topics, decisions, risks, questions, and tasks will update when complete."
+        VStack(alignment: .leading, spacing: 8) {
+            if let cloudStatus = postRecordingTranscription.statusByMeetingID[meeting.id] {
+                switch cloudStatus.phase {
+                case .waiting, .requestingUploadPolicy, .uploading, .submitting, .polling, .downloadingResult:
+                    SummaryExtractingBanner(
+                        title: cloudStatus.engine == .aliyunCloud
+                            ? langMgr.t("阿里云会后精准转写进行中", "Aliyun accurate transcription in progress")
+                            : langMgr.t("本地 Qwen3-ASR 精准转写进行中", "Local Qwen3-ASR refinement in progress"),
+                        message: cloudStatus.message ?? langMgr.t(
+                            "本地实时文字会一直保留；完整结果校验并保存成功后，才会一次性合并本次录音区间。",
+                            "Local live text remains available. The session is merged only after the complete result is validated and saved."
+                        )
+                    )
+                case .failed:
+                    SummaryStatusBanner(
+                        icon: "exclamationmark.arrow.triangle.2.circlepath",
+                        message: cloudStatus.message ?? langMgr.t(
+                            "会后精准转写失败，本地实时文字已保留。",
+                            "Accurate post-recording transcription failed; local live text was retained."
+                        ),
+                        tint: .orange,
+                        actionTitle: langMgr.t("重试", "Retry"),
+                        action: { postRecordingTranscription.retryLatest(for: meeting.id) }
+                    )
+                case .succeeded:
+                    SummaryStatusBanner(
+                        icon: "checkmark.circle.fill",
+                        message: cloudStatus.message ?? langMgr.t(
+                            cloudStatus.engine == .aliyunCloud
+                                ? "阿里云会后精准转写已完成。"
+                                : "本地 Qwen3-ASR 会后精准转写已完成。",
+                            cloudStatus.engine == .aliyunCloud
+                                ? "Aliyun accurate post-recording transcription is complete."
+                                : "Local Qwen3-ASR post-recording refinement is complete."
+                        ),
+                        tint: .green
+                    )
+                }
+            }
+
+            if isExtracting {
+                SummaryExtractingBanner(
+                    title: langMgr.t("正在提取结构化内容", "Extracting structured content"),
+                    message: langMgr.t(
+                        "正在分析转录原文，完成后会更新议题、决策、风险、待确认问题和待办。",
+                        "Analyzing the transcript. Topics, decisions, risks, questions, and tasks will update when complete."
+                    )
                 )
-            )
-        } else if let message = viewModel.structuredSummaryErrorMessage {
-            SummaryStatusBanner(
-                icon: "exclamationmark.triangle",
-                message: message,
-                tint: .red,
-                actionTitle: langMgr.t("重试", "Retry"),
-                action: { viewModel.refreshStructuredSummary() }
-            )
-        } else if viewModel.isStructuredSummaryStale {
-            SummaryStatusBanner(
-                icon: "arrow.triangle.2.circlepath",
-                message: langMgr.t("转录原文已变化，行动摘要可能不是最新。", "Transcript changed. This digest may be out of date."),
-                tint: .orange,
-                actionTitle: langMgr.t("刷新", "Refresh"),
-                action: { viewModel.refreshStructuredSummary() }
-            )
+            } else if let message = viewModel.structuredSummaryErrorMessage {
+                SummaryStatusBanner(
+                    icon: "exclamationmark.triangle",
+                    message: message,
+                    tint: .red,
+                    actionTitle: langMgr.t("重试", "Retry"),
+                    action: { viewModel.refreshStructuredSummary() }
+                )
+            } else if viewModel.isStructuredSummaryStale {
+                SummaryStatusBanner(
+                    icon: "arrow.triangle.2.circlepath",
+                    message: langMgr.t("转录原文已变化，行动摘要可能不是最新。", "Transcript changed. This digest may be out of date."),
+                    tint: .orange,
+                    actionTitle: langMgr.t("刷新", "Refresh"),
+                    action: { viewModel.refreshStructuredSummary() }
+                )
+            }
         }
     }
 
@@ -323,8 +365,22 @@ private struct SummaryStatusBanner: View {
     let icon: String
     let message: String
     let tint: Color
-    let actionTitle: String
-    let action: () -> Void
+    let actionTitle: String?
+    let action: (() -> Void)?
+
+    init(
+        icon: String,
+        message: String,
+        tint: Color,
+        actionTitle: String? = nil,
+        action: (() -> Void)? = nil
+    ) {
+        self.icon = icon
+        self.message = message
+        self.tint = tint
+        self.actionTitle = actionTitle
+        self.action = action
+    }
 
     var body: some View {
         HStack(spacing: 10) {
@@ -335,9 +391,11 @@ private struct SummaryStatusBanner: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             Spacer()
-            Button(actionTitle, action: action)
-                .font(.caption.weight(.medium))
-                .buttonStyle(.bordered)
+            if let actionTitle, let action {
+                Button(actionTitle, action: action)
+                    .font(.caption.weight(.medium))
+                    .buttonStyle(.bordered)
+            }
         }
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)

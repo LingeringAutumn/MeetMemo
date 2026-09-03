@@ -8,6 +8,7 @@ struct SettingsView: View {
     @ObservedObject private var speechInstaller = SpeechModelInstaller.shared
     @ObservedObject private var sherpaModel = SherpaModelManager.shared
     @ObservedObject private var funASRNanoModel = FunASRNanoModelManager.shared
+    @ObservedObject private var qwen3ASRModel = Qwen3ASRModelManager.shared
     @ObservedObject private var audioManager = AudioManager.shared
     @ObservedObject private var voiceInputHotkey = VoiceInputHotkeyManager.shared
     @ObservedObject private var voiceInputManager = VoiceInputManager.shared
@@ -19,6 +20,7 @@ struct SettingsView: View {
     @State private var inputMonitoringPermissionGranted = false
     @State private var audioRecordingPermission = AudioRecordingPermission()
     @State private var sttEngine: STTEngine = UserDefaultsManager.shared.sttEngine
+    @State private var cloudTranscriptionMode = UserDefaultsManager.shared.cloudTranscriptionMode
     @State private var voiceInputEnabled = UserDefaultsManager.shared.voiceInputEnabled
     @State private var voiceInputTriggerMode = UserDefaultsManager.shared.voiceInputTriggerMode
     @State private var voiceInputTriggerKey = VoiceInputTriggerKey.resolve(from: UserDefaultsManager.shared.voiceInputShortcut)
@@ -74,6 +76,7 @@ struct SettingsView: View {
             Task { await speechInstaller.checkModelAvailability() }
             Task { await sherpaModel.refreshReadiness() }
             Task { await funASRNanoModel.refreshReadiness() }
+            Task { await qwen3ASRModel.refreshReadiness() }
         }
         .onChange(of: audioRecordingPermission.status) { _, newValue in
             systemAudioPermissionGranted = (newValue == .authorized)
@@ -87,10 +90,11 @@ struct SettingsView: View {
             Task { await speechInstaller.checkModelAvailability() }
             Task { await sherpaModel.refreshReadiness() }
             Task { await funASRNanoModel.refreshReadiness() }
+            Task { await qwen3ASRModel.refreshReadiness() }
         }
         .onDisappear {
             DispatchQueue.main.async {
-                viewModel.saveSettings(showMessage: false)
+                persistSettingsAndCloudMode(showMessage: false)
             }
         }
         .alert(item: $viewModel.activeAlert) { alert in
@@ -220,7 +224,11 @@ struct SettingsView: View {
                 } else {
                     sherpaSenseVoiceEngineCard
                 }
+
+                qwen3PostRecordingModelCard
             }
+
+            aliyunAccurateTranscriptionSettings
 
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
@@ -274,6 +282,69 @@ struct SettingsView: View {
                     .frame(maxWidth: .infinity)
             }
         }
+    }
+
+    private var aliyunAccurateTranscriptionSettings: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(langMgr.t("会后精准转写", "Post-recording Accurate Transcription"))
+                .font(.headline)
+                .foregroundColor(.primary)
+
+            Picker("", selection: $cloudTranscriptionMode) {
+                Text(langMgr.t("仅本地", "Local Only")).tag(CloudTranscriptionMode.localOnly)
+                Text(langMgr.t("阿里云精准", "Alibaba Cloud Accurate")).tag(CloudTranscriptionMode.aliyunAccurate)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(width: 360, alignment: .leading)
+            .disabled(audioManager.isRecording)
+            .onChange(of: cloudTranscriptionMode) { _, newValue in
+                // Returning to local-only is an immediate safety action. Enabling cloud
+                // becomes active only after Save succeeds and the Keychain write completes.
+                if newValue == .localOnly {
+                    UserDefaultsManager.shared.cloudTranscriptionMode = .localOnly
+                }
+            }
+
+            Text(langMgr.t(
+                "录制期间继续用本地模型显示临时文字。结束后，若选择阿里云精准，会上传本次同步双声道录音：声道 0 固定为候选人，声道 1 固定为面试官；失败时保留本地转写并可重试。",
+                "Local live captions remain available while recording. After stopping, Alibaba Cloud Accurate uploads the synchronized stereo recording: channel 0 is always the candidate and channel 1 the interviewer. Local text is retained if the cloud job fails and the job can be retried."
+            ))
+            .font(.caption)
+            .foregroundColor(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+
+            if cloudTranscriptionMode == .aliyunAccurate {
+                HStack(spacing: 8) {
+                    SecureField("DashScope API Key", text: $viewModel.aliyunDashScopeAPIKey)
+                        .textFieldStyle(.roundedBorder)
+                    Button(langMgr.t("测试连接", "Test")) {
+                        viewModel.testAliyunConnection()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(
+                        viewModel.isTestingAliyun
+                            || viewModel.aliyunDashScopeAPIKey
+                                .trimmingCharacters(in: .whitespacesAndNewlines)
+                                .isEmpty
+                    )
+                }
+
+                Label(
+                    langMgr.t(
+                        "密钥只保存在 macOS 钥匙串中，不会写入会议文件或日志。保存设置后才会启用云端模式；音频会发送到阿里云百炼，双声道通常按两个声道分别计费。",
+                        "The key is stored only in macOS Keychain, never in meeting files or logs. Cloud mode is enabled only after saving; audio is sent to Alibaba Cloud Model Studio, and stereo audio is normally billed as two channels."
+                    ),
+                    systemImage: "lock.shield"
+                )
+                .font(.caption2)
+                .foregroundColor(.secondary)
+
+            }
+        }
+        .padding(12)
+        .background(Color.secondary.opacity(0.08))
+        .cornerRadius(8)
     }
 
     private var voiceInputSettings: some View {
@@ -484,8 +555,8 @@ struct SettingsView: View {
             )
         case .funASRNano:
             return langMgr.t(
-                "高精度多语言/方言识别，支持区分发言人；模型约 1GB，需先下载，下载后离线运行。基于 LLM，CPU 上比 SenseVoice 略慢、内存占用更高，转写会在每句说完后稍有延迟。",
-                "High-accuracy multilingual/dialect recognition with speaker separation. ~1 GB model, download required, runs offline afterward. LLM-based: slightly slower than SenseVoice on CPU, uses more memory, and text appears with a short delay after each utterance."
+                "实验性本地模型（约 1GB）。部分中文场景准确率较高，但生成式解码可能出现短语循环；程序会拦截明显异常结果。面试录制建议继续用稳定的 SenseVoice 预览，结束后再使用 Qwen3 或阿里云精准转写。",
+                "Experimental local model (~1 GB). It can be accurate for some Chinese audio, but generative decoding may loop short phrases; obvious bad output is filtered. For interviews, use stable SenseVoice during capture and Qwen3 or Alibaba Cloud after recording."
             )
         }
     }
@@ -539,6 +610,77 @@ struct SettingsView: View {
                     .foregroundColor(.red)
                     .fixedSize(horizontal: false, vertical: true)
             }
+        }
+        .padding(12)
+        .background(Color.secondary.opacity(0.08))
+        .cornerRadius(8)
+    }
+
+    private var qwen3PostRecordingModelCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(langMgr.t("会后本地精准模型", "Post-recording Local Model"))
+                        .font(.subheadline.weight(.semibold))
+                    Text("sherpa-onnx · Qwen3-ASR-0.6B INT8")
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+                Text(langMgr.t("顺序处理双轨", "Sequential dual-track"))
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+
+            Text(langMgr.t(
+                "用于录制结束后的本地重转写，也是阿里云失败时的离线兜底。麦克风与系统音频会按共享时间轴逐轨处理，不会同时加载两个 Qwen 实例，也不会运行发言人聚类。",
+                "Used for accurate local retranscription after recording and as the offline fallback for Alibaba Cloud. Mic and system tracks are processed sequentially on their shared timeline, without loading two Qwen instances or running speaker clustering."
+            ))
+            .font(.caption)
+            .foregroundColor(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: 10) {
+                Image(systemName: qwen3ASRModel.isReady ? "checkmark.shield.fill" : "arrow.down.circle")
+                    .foregroundColor(qwen3ASRModel.isReady ? .green : .secondary)
+                Text(qwen3ASRModelStatusText)
+                    .foregroundColor(.secondary)
+                Spacer()
+                Button {
+                    Task { await qwen3ASRModel.prepareModels() }
+                } label: {
+                    if qwen3ASRModel.isPreparing {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Text(qwen3ASRModel.isReady
+                             ? langMgr.t("重新校验", "Verify Again")
+                             : langMgr.t("下载模型", "Download Models"))
+                    }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(audioManager.isRecording || qwen3ASRModel.isPreparing)
+            }
+
+            if qwen3ASRModel.isPreparing, let progress = qwen3ASRModel.downloadProgress {
+                ProgressView(value: progress)
+                    .progressViewStyle(.linear)
+            }
+
+            if let error = qwen3ASRModel.errorMessage {
+                Text(error)
+                    .font(.caption)
+                    .foregroundColor(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Text(langMgr.t(
+                "优先从 ModelScope 国内节点下载，支持断点续传；Qwen 模型文件均经过 SHA-256 校验。",
+                "Downloads from the mainland ModelScope mirror first, supports resume, and SHA-256 verifies every Qwen model file."
+            ))
+            .font(.caption2)
+            .foregroundColor(.secondary)
         }
         .padding(12)
         .background(Color.secondary.opacity(0.08))
@@ -640,6 +782,28 @@ struct SettingsView: View {
         )
     }
 
+    private var qwen3ASRModelStatusText: String {
+        if qwen3ASRModel.isPreparing {
+            if let progress = qwen3ASRModel.downloadProgress {
+                return langMgr.t(
+                    "正在下载并校验 Qwen3-ASR… \(Int(progress * 100))%",
+                    "Downloading and verifying Qwen3-ASR… \(Int(progress * 100))%"
+                )
+            }
+            return langMgr.t("正在准备 Qwen3-ASR…", "Preparing Qwen3-ASR…")
+        }
+        if qwen3ASRModel.isReady {
+            return langMgr.t(
+                "模型已就绪（缓存 \(qwen3ASRModel.cacheSizeText)）",
+                "Model ready (\(qwen3ASRModel.cacheSizeText) cached)"
+            )
+        }
+        return langMgr.t(
+            "尚未下载（约 \(qwen3ASRModel.installSizeText)）",
+            "Not downloaded (~\(qwen3ASRModel.installSizeText))"
+        )
+    }
+
     private var senseVoiceInstallSizeText: String {
         let formatter = ByteCountFormatter()
         formatter.allowedUnits = [.useMB, .useGB]
@@ -731,7 +895,7 @@ struct SettingsView: View {
             Spacer()
 
             Button {
-                viewModel.saveSettings()
+                persistSettingsAndCloudMode(showMessage: true)
             } label: {
                 Text(langMgr.t("保存设置", "Save Settings"))
                     .font(.headline)
@@ -744,6 +908,26 @@ struct SettingsView: View {
             .buttonStyle(.plain)
         }
         .padding(.top)
+    }
+
+    private func persistSettingsAndCloudMode(showMessage: Bool) {
+        let key = viewModel.aliyunDashScopeAPIKey
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if cloudTranscriptionMode == .aliyunAccurate, key.isEmpty {
+            if showMessage {
+                viewModel.activeAlert = AlertMessage(
+                    title: langMgr.t("设置保存失败", "Settings Save Failed"),
+                    message: langMgr.t(
+                        "启用阿里云精准转写前，请先填写 DashScope API Key。",
+                        "Enter a DashScope API Key before enabling Alibaba Cloud Accurate."
+                    )
+                )
+            }
+            return
+        }
+        if viewModel.saveSettings(showMessage: showMessage) {
+            UserDefaultsManager.shared.cloudTranscriptionMode = cloudTranscriptionMode
+        }
     }
 
     private func checkPermissions() {
@@ -931,7 +1115,8 @@ struct SettingsView: View {
 }
 
 private struct AppInfoCard: View {
-    private let githubURL = URL(string: "https://github.com/abcwyc/MeetMemo")!
+    private let forkURL = URL(string: "https://github.com/LingeringAutumn/MeetMemo")!
+    private let upstreamURL = URL(string: "https://github.com/abcwyc/MeetMemo")!
 
     private var appVersion: String {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
@@ -939,10 +1124,10 @@ private struct AppInfoCard: View {
 
     private var versionText: String {
         if appVersion.isEmpty {
-            return "Version Beta · Built by youcai"
+            return "Unofficial interview fork · Upstream by youcai"
         }
 
-        return "Version \(appVersion) Beta · Built by youcai"
+        return "Version \(appVersion) · Unofficial interview fork · Upstream by youcai"
     }
 
     var body: some View {
@@ -950,7 +1135,7 @@ private struct AppInfoCard: View {
             Divider()
 
             VStack(alignment: .leading, spacing: 8) {
-                Text("MeetMemo")
+                Text("MeetMemo Interview")
                     .font(.headline)
                     .foregroundColor(.primary)
 
@@ -962,9 +1147,17 @@ private struct AppInfoCard: View {
                     .font(.caption)
                     .foregroundColor(.secondary.opacity(0.82))
 
-                Link(destination: githubURL) {
+                Link(destination: forkURL) {
                     HStack(spacing: 4) {
-                        Text("GitHub 项目：abcwyc/MeetMemo")
+                        Text("修改版项目：LingeringAutumn/MeetMemo")
+                        Image(systemName: "arrow.up.right")
+                            .font(.caption2.weight(.semibold))
+                    }
+                }
+
+                Link(destination: upstreamURL) {
+                    HStack(spacing: 4) {
+                        Text("上游项目：abcwyc/MeetMemo")
                         Image(systemName: "arrow.up.right")
                             .font(.caption2.weight(.semibold))
                     }

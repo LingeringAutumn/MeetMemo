@@ -16,6 +16,11 @@ protocol STTProvider: AnyObject {
     @discardableResult
     func awaitPendingFinalization(timeout: TimeInterval) async -> STTFinalizationStatus
 
+    /// Waits until provider-owned model/runtime resources have actually been released after
+    /// `disconnect()`. The default is immediate for providers that tear down synchronously.
+    @discardableResult
+    func awaitShutdown(timeout: TimeInterval) async -> STTFinalizationStatus
+
     /// Runs any post-recording corrections (e.g. offline speaker diarization refinement)
     /// and emits the result via `onTranscriptCorrection`. Default no-op.
     func applyOfflineRefinement() async
@@ -31,6 +36,12 @@ extension STTProvider {
     }
 
     func applyOfflineRefinement() async {}
+
+    @discardableResult
+    func awaitShutdown(timeout: TimeInterval) async -> STTFinalizationStatus {
+        _ = timeout
+        return .completed
+    }
 }
 
 enum STTFinalizationStatus: Hashable {

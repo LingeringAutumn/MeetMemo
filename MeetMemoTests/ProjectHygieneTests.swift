@@ -80,10 +80,18 @@ final class ProjectHygieneTests: XCTestCase {
         XCTAssertTrue(viewModel.contains("try Task.checkCancellation()"))
     }
 
-    func testSystemAudioUsesGlobalTapAndBuffersColdStartAudio() throws {
-        let audioManager = try read("MeetMemo/Managers/AudioManager.swift", from: repositoryRoot())
+    func testSystemAudioUsesMeetingProcessAllowlistAndBuffersColdStartAudio() throws {
+        let root = repositoryRoot()
+        let audioManager = try read("MeetMemo/Managers/AudioManager.swift", from: root)
+        let processTap = try read("MeetMemo/ProcessTap/ProcessTap.swift", from: root)
 
-        XCTAssertTrue(audioManager.contains("TapTarget.systemAudio(processObjectIDs: [])"))
+        XCTAssertTrue(audioManager.contains("resolveSupportedMeetingAudioProcesses()"))
+        XCTAssertTrue(audioManager.contains("supportedMeetingProcessObjectIDs"))
+        XCTAssertTrue(audioManager.contains("TapTarget.systemAudio(processObjectIDs: meetingProcessObjectIDs)"))
+        XCTAssertFalse(audioManager.contains("TapTarget.systemAudio(processObjectIDs: [])"))
+        XCTAssertFalse(processTap.contains("stereoGlobalTapButExcludeProcesses"))
+        XCTAssertTrue(processTap.contains("CATapDescription(stereoMixdownOfProcesses: processObjectIDs)"))
+        XCTAssertTrue(processTap.contains("noSupportedMeetingAudioProcess"))
         XCTAssertFalse(audioManager.contains("restartSystemAudioTapIfNeeded"))
         XCTAssertFalse(audioManager.contains("Task.sleep(for: .milliseconds(800))"))
         XCTAssertTrue(audioManager.contains("bufferPendingSystemAudio(data)"))
@@ -112,6 +120,42 @@ final class ProjectHygieneTests: XCTestCase {
         XCTAssertFalse(extractor.contains("Structured extraction response prefix"))
         XCTAssertFalse(extractor.contains("String(cleaned.prefix"))
         XCTAssertFalse(extractor.contains("decode failed: \\(error)"))
+    }
+
+    func testRecoveredRecordingCannotStartAutomaticPostProcessing() throws {
+        let root = repositoryRoot()
+        let sessionManager = try read("MeetMemo/Managers/RecordingSessionManager.swift", from: root)
+        let service = try read("MeetMemo/Services/AliyunPostRecordingTranscriptionService.swift", from: root)
+
+        guard let recoveryStart = sessionManager.range(of: "private func recoverInterruptedRecordings()"),
+              let recoveryEnd = sessionManager.range(
+                of: "\n    }\n}",
+                range: recoveryStart.upperBound..<sessionManager.endIndex
+              ) else {
+            XCTFail("Expected interrupted-recording recovery implementation")
+            return
+        }
+        let recoveryBody = String(sessionManager[recoveryStart.lowerBound..<recoveryEnd.upperBound])
+        XCTAssertTrue(recoveryBody.contains(".meetingRecordingArtifactRecovered"))
+        XCTAssertFalse(recoveryBody.contains(".meetingRecordingArtifactReady"))
+
+        guard let recoveredHandlerStart = service.range(of: "private func handleRecoveredArtifact"),
+              let cloudStart = service.range(
+                of: "private func startCloudTranscription",
+                range: recoveredHandlerStart.upperBound..<service.endIndex
+              ) else {
+            XCTFail("Expected recovered and automatic transcription handlers")
+            return
+        }
+        let recoveredHandler = String(service[recoveredHandlerStart.lowerBound..<cloudStart.lowerBound])
+        XCTAssertFalse(recoveredHandler.contains("startCloudTranscription("))
+        XCTAssertFalse(recoveredHandler.contains("startLocalQwenTranscription("))
+    }
+
+    func testPrivacyUsageDescriptionsDoNotPromiseAudioNeverLeavesTheDevice() throws {
+        let plist = try read("MeetMemo/Info.plist", from: repositoryRoot())
+        XCTAssertFalse(plist.localizedCaseInsensitiveContains("never leaves"))
+        XCTAssertTrue(plist.contains("unless you enable optional cloud-accurate transcription"))
     }
 
     func testAppSourcesAvoidCrashOnlyShortcutsOutsideGeneratedBridge() throws {

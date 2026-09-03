@@ -3,13 +3,14 @@ import Foundation
 
 final class AudioProcessingPipeline: @unchecked Sendable {
     typealias AudioDataHandler = @Sendable (Data, AudioSource) -> Void
+    typealias TimedAudioDataHandler = @Sendable (Data, AudioSource, Int64?) -> Void
     typealias AudioLevelHandler = @Sendable (Float, AudioSource) -> Void
 
     private let source: AudioSource
     private let inputFormat: AVAudioFormat
     private let targetFormat: AVAudioFormat
     private let converter: AVAudioConverter
-    private let onAudioData: AudioDataHandler
+    private let onTimedAudioData: TimedAudioDataHandler
     private let onAudioLevel: AudioLevelHandler
     private let queue: DispatchQueue
     private let stateLock = NSLock()
@@ -23,13 +24,33 @@ final class AudioProcessingPipeline: @unchecked Sendable {
     private var isDraining = false
     private var isStopped = false
     private var drainWaiters: [CheckedContinuation<Void, Never>] = []
+    /// Confined to `queue`; used to timestamp converter-tail and backpressure silence packets.
+    private var lastEmittedEndSample: Int64?
+
+    convenience init?(
+        source: AudioSource,
+        inputFormat: AVAudioFormat,
+        targetFormat: AVAudioFormat,
+        maxPendingBuffers: Int = 96,
+        onAudioData: @escaping AudioDataHandler,
+        onAudioLevel: @escaping AudioLevelHandler
+    ) {
+        self.init(
+            source: source,
+            inputFormat: inputFormat,
+            targetFormat: targetFormat,
+            maxPendingBuffers: maxPendingBuffers,
+            onTimedAudioData: { data, source, _ in onAudioData(data, source) },
+            onAudioLevel: onAudioLevel
+        )
+    }
 
     init?(
         source: AudioSource,
         inputFormat: AVAudioFormat,
         targetFormat: AVAudioFormat,
         maxPendingBuffers: Int = 96,
-        onAudioData: @escaping AudioDataHandler,
+        onTimedAudioData: @escaping TimedAudioDataHandler,
         onAudioLevel: @escaping AudioLevelHandler
     ) {
         guard let converter = AVAudioConverter(from: inputFormat, to: targetFormat) else {
@@ -40,13 +61,13 @@ final class AudioProcessingPipeline: @unchecked Sendable {
         self.inputFormat = inputFormat
         self.targetFormat = targetFormat
         self.converter = converter
-        self.onAudioData = onAudioData
+        self.onTimedAudioData = onTimedAudioData
         self.onAudioLevel = onAudioLevel
         self.maxPendingBuffers = maxPendingBuffers
         self.queue = DispatchQueue(label: "io.meetmemo.audio.pipeline.\(source.rawValue)", qos: .userInitiated)
     }
 
-    func enqueue(_ buffer: AVAudioPCMBuffer) {
+    func enqueue(_ buffer: AVAudioPCMBuffer, startingAtSample samplePosition: Int64? = nil) {
         let outputFramesForBuffer = convertedFrameCount(for: buffer)
         let leadingSilenceFrames: Int? = stateLock.withLock {
             guard isAcceptingAudio, !isStopped else { return nil }
@@ -83,7 +104,11 @@ final class AudioProcessingPipeline: @unchecked Sendable {
             guard stateLock.withLock({
                 !isStopped
             }) else { return }
-            process(copiedBuffer, leadingSilenceFrames: leadingSilenceFrames)
+            process(
+                copiedBuffer,
+                leadingSilenceFrames: leadingSilenceFrames,
+                startingAtSample: samplePosition
+            )
         }
     }
 
@@ -124,7 +149,10 @@ final class AudioProcessingPipeline: @unchecked Sendable {
                     return frames
                 }
                 flushConverterTail()
-                emitSilence(frameCount: trailingSilenceFrames)
+                emitSilence(
+                    frameCount: trailingSilenceFrames,
+                    startingAtSample: lastEmittedEndSample
+                )
                 let waiters: [CheckedContinuation<Void, Never>] = stateLock.withLock {
                     isStopped = true
                     isDraining = false
@@ -139,8 +167,18 @@ final class AudioProcessingPipeline: @unchecked Sendable {
         }
     }
 
-    private func process(_ buffer: AVAudioPCMBuffer, leadingSilenceFrames: Int) {
-        emitSilence(frameCount: leadingSilenceFrames)
+    private func process(
+        _ buffer: AVAudioPCMBuffer,
+        leadingSilenceFrames: Int,
+        startingAtSample samplePosition: Int64?
+    ) {
+        let leadingSilenceStart = samplePosition.map {
+            max(0, $0 - Int64(leadingSilenceFrames))
+        }
+        emitSilence(
+            frameCount: leadingSilenceFrames,
+            startingAtSample: leadingSilenceStart
+        )
 
         let rms = Self.rmsLevel(in: buffer)
         onAudioLevel(rms, source)
@@ -148,7 +186,7 @@ final class AudioProcessingPipeline: @unchecked Sendable {
         let expectedOutputFrames = convertedFrameCount(for: buffer)
         let outputFrameCapacity = AVAudioFrameCount(max(1, expectedOutputFrames)) + 32
         guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: outputFrameCapacity) else {
-            emitSilence(frameCount: expectedOutputFrames)
+            emitSilence(frameCount: expectedOutputFrames, startingAtSample: samplePosition)
             return
         }
 
@@ -160,22 +198,25 @@ final class AudioProcessingPipeline: @unchecked Sendable {
 
         guard error == nil,
               status == .haveData || status == .inputRanDry || status == .endOfStream else {
-            emitSilence(frameCount: expectedOutputFrames)
+            emitSilence(frameCount: expectedOutputFrames, startingAtSample: samplePosition)
             return
         }
 
         guard let channelData = outputBuffer.int16ChannelData?[0] else {
-            emitSilence(frameCount: expectedOutputFrames)
+            emitSilence(frameCount: expectedOutputFrames, startingAtSample: samplePosition)
             return
         }
 
         let frameCount = Int(outputBuffer.frameLength)
         guard frameCount > 0 else {
-            emitSilence(frameCount: expectedOutputFrames)
+            emitSilence(frameCount: expectedOutputFrames, startingAtSample: samplePosition)
             return
         }
 
-        onAudioData(Data(bytes: channelData, count: frameCount * 2), source)
+        emitAudioData(
+            Data(bytes: channelData, count: frameCount * MemoryLayout<Int16>.size),
+            startingAtSample: samplePosition
+        )
     }
 
     /// AVAudioConverter may retain a few resampled frames after the last input buffer. Signal
@@ -197,9 +238,9 @@ final class AudioProcessingPipeline: @unchecked Sendable {
             }
 
             if let channelData = outputBuffer.int16ChannelData?[0], outputBuffer.frameLength > 0 {
-                onAudioData(
+                emitAudioData(
                     Data(bytes: channelData, count: Int(outputBuffer.frameLength) * MemoryLayout<Int16>.size),
-                    source
+                    startingAtSample: lastEmittedEndSample
                 )
             }
 
@@ -214,14 +255,32 @@ final class AudioProcessingPipeline: @unchecked Sendable {
         return max(0, Int((Double(buffer.frameLength) * targetFormat.sampleRate / buffer.format.sampleRate).rounded()))
     }
 
-    private func emitSilence(frameCount: Int) {
+    private func emitSilence(frameCount: Int, startingAtSample samplePosition: Int64? = nil) {
         guard frameCount > 0 else { return }
         let framesPerChunk = max(1, Int(targetFormat.sampleRate))
         var remainingFrames = frameCount
+        var nextSamplePosition = samplePosition
         while remainingFrames > 0 {
             let chunkFrames = min(remainingFrames, framesPerChunk)
-            onAudioData(Data(repeating: 0, count: chunkFrames * MemoryLayout<Int16>.size), source)
+            emitAudioData(
+                Data(repeating: 0, count: chunkFrames * MemoryLayout<Int16>.size),
+                startingAtSample: nextSamplePosition
+            )
+            if let nextSamplePosition {
+                self.lastEmittedEndSample = nextSamplePosition + Int64(chunkFrames)
+            }
+            nextSamplePosition = lastEmittedEndSample
             remainingFrames -= chunkFrames
+        }
+    }
+
+    private func emitAudioData(_ data: Data, startingAtSample samplePosition: Int64?) {
+        onTimedAudioData(data, source, samplePosition)
+        if let samplePosition {
+            lastEmittedEndSample = samplePosition + Int64(data.count / MemoryLayout<Int16>.size)
+        } else if let lastEmittedEndSample {
+            self.lastEmittedEndSample = lastEmittedEndSample
+                + Int64(data.count / MemoryLayout<Int16>.size)
         }
     }
 

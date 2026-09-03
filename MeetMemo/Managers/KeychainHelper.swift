@@ -12,19 +12,37 @@ enum ProviderConfigLoadResult {
     case unavailable(OSStatus)
 }
 
+enum SecretLoadResult {
+    case success(String)
+    case notFound
+    case authenticationFailed
+    case unavailable(OSStatus)
+}
+
 /// Manages secure storage of sensitive data using the macOS Keychain
 class KeychainHelper {
     static let shared = KeychainHelper()
     
-    private let serviceName = "youcai.meetmemo"
+    /// Keep the legacy service only for compatibility builds that intentionally
+    /// retain the upstream bundle ID. Independent fork builds use their own
+    /// bundle identifier as the Keychain service namespace.
+    private let serviceName: String
     private let providerConfigKey = "providerConfig"
+    private let aliyunDashScopeAPIKeyKey = "aliyunDashScopeAPIKey"
     private let legacyProviderKeys = [
         "llmApiKey",
         "llmBaseURL",
         "llmModel"
     ]
     
-    private init() {}
+    private init() {
+        if let bundleIdentifier = Bundle.main.bundleIdentifier,
+           bundleIdentifier != "com.youcai.meetmemo" {
+            serviceName = bundleIdentifier
+        } else {
+            serviceName = "youcai.meetmemo"
+        }
+    }
 
     // MARK: - Provider configuration
 
@@ -112,6 +130,41 @@ class KeychainHelper {
         var settings = getProviderConfig() ?? Settings()
         settings.llmModel = value
         return saveProviderConfig(settings)
+    }
+
+    // MARK: - Aliyun DashScope
+
+    /// The DashScope credential is intentionally stored as a separate Keychain item.
+    /// It must never be copied into UserDefaults or the meeting/job JSON files.
+    func getAliyunDashScopeAPIKey() -> String? {
+        guard case .success(let value) = loadAliyunDashScopeAPIKey() else { return nil }
+        return value
+    }
+
+    func loadAliyunDashScopeAPIKey() -> SecretLoadResult {
+        switch getDataResult(forKey: aliyunDashScopeAPIKeyKey, allowAuthentication: true) {
+        case .success(let data):
+            guard let value = String(data: data, encoding: .utf8) else {
+                return .unavailable(errSecDecode)
+            }
+            return .success(value)
+        case .notFound:
+            return .notFound
+        case .authenticationFailed:
+            return .authenticationFailed
+        case .unavailable(let status):
+            return .unavailable(status)
+        case .decodeFailed:
+            return .unavailable(errSecDecode)
+        }
+    }
+
+    func saveAliyunDashScopeAPIKey(_ value: String) -> Bool {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            return delete(forKey: aliyunDashScopeAPIKeyKey)
+        }
+        return save(trimmed, forKey: aliyunDashScopeAPIKeyKey)
     }
     
     /// Saves a string value to the keychain
@@ -270,7 +323,7 @@ class KeychainHelper {
         ]
         
         let status = SecItemDelete(query as CFDictionary)
-        return status == errSecSuccess
+        return status == errSecSuccess || status == errSecItemNotFound
     }
 }
 

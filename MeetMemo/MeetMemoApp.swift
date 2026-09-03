@@ -22,10 +22,16 @@ struct MeetMemoApp: App {
             ContentView()
                 .environmentObject(LanguageManager.shared)
                 .preferredColorScheme(appearanceMgr.appearance == .light ? .light : .dark)
-                .frame(minWidth: 500, minHeight: 400)
+                .frame(
+                    minWidth: 500,
+                    maxWidth: .infinity,
+                    minHeight: 400,
+                    maxHeight: .infinity,
+                    alignment: .topLeading
+                )
                 .background(MainWindowAppearanceSync(appearance: appearanceMgr.appearance))
         }
-        .windowResizability(.contentSize)
+        .windowResizability(.contentMinSize)
         .defaultSize(width: 1000, height: 600)
     }
 }

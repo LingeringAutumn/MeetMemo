@@ -9,7 +9,8 @@ private enum SidebarLayout {
     static let primaryButtonMinWidth: CGFloat = 112
     static let secondaryButtonMinWidth: CGFloat = 76
     static let secondaryButtonPreferredWidth: CGFloat = 96
-    static let sidebarMinimumWidth: CGFloat = 230
+    // 220 pt action capsule + 24 pt outer padding; keep both buttons reachable.
+    static let sidebarMinimumWidth: CGFloat = 244
     static let sidebarPreferredWidth: CGFloat = 260
     static let listTopPadding: CGFloat = 12
 
@@ -538,12 +539,16 @@ struct TranscriptChunkRowView: View {
                         .font(.subheadline)
                         .fontWeight(.semibold)
                         .foregroundColor(chunk.source == .mic ? .blue : .orange)
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
 
                     if let speakerLabel = chunk.speakerLabel {
                         Text(speakerLabel)
                             .font(.subheadline)
                             .fontWeight(.semibold)
                             .foregroundColor(.primary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
                     }
 
                     if !chunk.isFinal {
@@ -565,6 +570,8 @@ struct TranscriptChunkRowView: View {
                     Text(chunk.timeLabel)
                         .font(.caption.monospacedDigit())
                         .foregroundColor(.secondary)
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
                 }
 
                 Text(chunk.text)
@@ -591,6 +598,7 @@ struct TranscriptChunkRowView: View {
             .padding(.vertical, 2)
             .background(backgroundColor)
             .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+            .fixedSize(horizontal: true, vertical: false)
     }
 
     private var displaySourceLabel: String {
@@ -598,8 +606,68 @@ struct TranscriptChunkRowView: View {
         case .mic:
             return langMgr.t("麦克风", "mic")
         case .system:
-            return langMgr.t("系统音频", "online")
+            return langMgr.t("系统音频", "system audio")
         }
+    }
+}
+
+private struct TranscriptProvenanceDisplay {
+    let icon: String
+    let title: String
+    let message: String
+    let tint: Color
+    var showsProgress = false
+    var retryAction: (() -> Void)? = nil
+}
+
+private struct TranscriptProvenanceBanner: View {
+    let display: TranscriptProvenanceDisplay
+    let retryTitle: String
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Group {
+                if display.showsProgress {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Image(systemName: display.icon)
+                        .foregroundStyle(display.tint)
+                }
+            }
+            .frame(width: 18, height: 18)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(display.title)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(1)
+                    .help(display.title)
+                Text(display.message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .help(display.message)
+            }
+
+            Spacer(minLength: 8)
+
+            if let retryAction = display.retryAction {
+                Button(retryTitle, action: retryAction)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .fixedSize()
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(display.tint.opacity(0.09))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(display.tint.opacity(0.22), lineWidth: 1)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 }
 
@@ -612,6 +680,7 @@ struct MeetingDetailContentView: View {
     let initialHasGeneratedNotes: Bool
     @StateObject private var viewModel: MeetingViewModel
     @StateObject private var recordingSessionManager = RecordingSessionManager.shared
+    @ObservedObject private var postRecordingTranscription = AliyunPostRecordingTranscriptionService.shared
     @EnvironmentObject var langMgr: LanguageManager
     @State private var showDeleteAlert = false
     @State private var isContextEditing = false
@@ -625,7 +694,7 @@ struct MeetingDetailContentView: View {
     @State private var hoveredTab: MeetingViewTab?
     @State private var isGenerateButtonHovered = false
     @State private var isRecordingButtonHovered = false
-    @State private var windowWidth: CGFloat = 1000
+    @State private var detailWidth: CGFloat = 0
     let onOpenSettings: () -> Void
     let onDelete: () -> Void
 
@@ -656,34 +725,42 @@ struct MeetingDetailContentView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            VStack(alignment: .leading, spacing: 25) {
-                detailHeader
+        VStack(alignment: .leading, spacing: 25) {
+            detailHeader
+                .fixedSize(horizontal: false, vertical: true)
 
-                VStack(alignment: .leading, spacing: 0) {
-                    switch viewModel.selectedTab {
-                    case .context:
-                        contextView
-                    case .transcript:
-                        transcriptView
-                    case .enhancedNotes:
-                        switch viewModel.aiNotesSubTab {
-                        case .notes:
-                            enhancedNotesView
-                        case .digest:
-                            MeetingSummaryView(viewModel: viewModel)
-                                .environmentObject(langMgr)
-                        }
-                    case .summary:
+            VStack(alignment: .leading, spacing: 0) {
+                switch viewModel.selectedTab {
+                case .context:
+                    contextView
+                case .transcript:
+                    transcriptView
+                case .enhancedNotes:
+                    switch viewModel.aiNotesSubTab {
+                    case .notes:
+                        enhancedNotesView
+                    case .digest:
                         MeetingSummaryView(viewModel: viewModel)
                             .environmentObject(langMgr)
                     }
+                case .summary:
+                    MeetingSummaryView(viewModel: viewModel)
+                        .environmentObject(langMgr)
                 }
-                .frame(maxHeight: .infinity)
             }
-            .padding(EdgeInsets(top: 12, leading: 16, bottom: 16, trailing: 16))
-            .frame(maxHeight: .infinity)
+            .frame(
+                maxWidth: .infinity,
+                maxHeight: .infinity,
+                alignment: .topLeading
+            )
+            .clipped()
         }
+        .padding(EdgeInsets(top: 12, leading: 16, bottom: 16, trailing: 16))
+        .frame(
+            maxWidth: .infinity,
+            maxHeight: .infinity,
+            alignment: .topLeading
+        )
         .overlay {
             if viewModel.isLoadingMeeting {
                 ProgressView(langMgr.t("加载会议内容中...", "Loading meeting..."))
@@ -732,7 +809,7 @@ struct MeetingDetailContentView: View {
             isEnhancedNotesEditing = false
             showCopyConfirmation = false
         }
-        .background(WindowWidthReader(width: $windowWidth))
+        .background(AvailableWidthReader(width: $detailWidth))
         .toolbar {
             ToolbarItem(placement: .navigation) {
                 detailActionButtons
@@ -741,6 +818,8 @@ struct MeetingDetailContentView: View {
             ToolbarItemGroup(placement: .primaryAction) {
                 if shouldShowToolbarTabs {
                     detailTabBar
+                } else {
+                    compactDetailTabMenu
                 }
             }
 
@@ -756,11 +835,15 @@ struct MeetingDetailContentView: View {
     }
 
     private var shouldShowToolbarTabs: Bool {
-        windowWidth >= 500
+        detailWidth >= 500
     }
 
     private var usesCompactToolbarActions: Bool {
-        windowWidth < 700
+        detailWidth < 700
+    }
+
+    private var usesCompactDetailHeader: Bool {
+        detailWidth < 520
     }
 
     private var detailActionButtons: some View {
@@ -816,6 +899,42 @@ struct MeetingDetailContentView: View {
         .fixedSize()
     }
 
+    private var compactDetailTabMenu: some View {
+        Menu {
+            ForEach(MeetingViewTab.displayOrder, id: \.self) { tab in
+                Button {
+                    viewModel.selectedTab = tab
+                } label: {
+                    Label(
+                        tab.label(using: langMgr),
+                        systemImage: viewModel.selectedTab == tab
+                            ? "checkmark"
+                            : compactTabSystemImage(for: tab)
+                    )
+                }
+            }
+        } label: {
+            Image(systemName: "rectangle.3.group")
+        }
+        .help(langMgr.t(
+            "切换页面：\(viewModel.selectedTab.label(using: langMgr))",
+            "Switch section: \(viewModel.selectedTab.label(using: langMgr))"
+        ))
+    }
+
+    private func compactTabSystemImage(for tab: MeetingViewTab) -> String {
+        switch tab {
+        case .context:
+            return "doc.text"
+        case .transcript:
+            return "list.bullet.rectangle"
+        case .enhancedNotes:
+            return "sparkles"
+        case .summary:
+            return "checklist"
+        }
+    }
+
     private func tabButtonBackgroundColor(for tab: MeetingViewTab) -> Color {
         if viewModel.selectedTab == tab {
             return Color.secondary.opacity(0.18)
@@ -835,7 +954,9 @@ struct MeetingDetailContentView: View {
 
                 Spacer()
 
-                titleActionButtons
+                if !usesCompactDetailHeader {
+                    titleActionButtons
+                }
                 moreMenu
             }
 
@@ -939,6 +1060,11 @@ struct MeetingDetailContentView: View {
 
     private var moreMenu: some View {
         Menu {
+            if usesCompactDetailHeader && hasTitleActionButtons {
+                compactTitleActionMenuItems
+                Divider()
+            }
+
             if viewModel.selectedTab == .context || viewModel.selectedTab == .enhancedNotes {
                 Button {
                     toggleCurrentEditingMode()
@@ -984,6 +1110,64 @@ struct MeetingDetailContentView: View {
         .menuIndicator(.hidden)
         .menuStyle(BorderlessButtonMenuStyle())
         .frame(width: 20, height: 20)
+    }
+
+    private var hasTitleActionButtons: Bool {
+        switch viewModel.selectedTab {
+        case .context, .transcript, .enhancedNotes:
+            return true
+        case .summary:
+            return false
+        }
+    }
+
+    @ViewBuilder
+    private var compactTitleActionMenuItems: some View {
+        if viewModel.selectedTab == .enhancedNotes && viewModel.toolbarHasGeneratedNotes {
+            Button {
+                viewModel.aiNotesSubTab = .notes
+            } label: {
+                Label(langMgr.t("会议纪要", "Meeting Notes"), systemImage: "doc.text")
+            }
+
+            Button {
+                viewModel.showActionDigest()
+            } label: {
+                Label(langMgr.t("行动摘要", "Action Digest"), systemImage: "list.bullet.rectangle")
+            }
+        }
+
+        if viewModel.selectedTab == .enhancedNotes {
+            Button {
+                openFollowUpTasksWindow()
+            } label: {
+                Label(langMgr.t("管理待办", "Tasks"), systemImage: "checklist")
+            }
+        }
+
+        if viewModel.selectedTab == .context {
+            Button {
+                isContextEditing = true
+                viewModel.addTextContextItem()
+            } label: {
+                Label(langMgr.t("添加文本", "Add Text"), systemImage: "text.alignleft")
+            }
+
+            Button {
+                isImportingContextFile = true
+            } label: {
+                Label(langMgr.t("导入文件", "Import File"), systemImage: "doc.badge.plus")
+            }
+        }
+
+        if viewModel.selectedTab == .transcript {
+            Button {
+                openSpeakerNamingWindow()
+            } label: {
+                Label(langMgr.t("标记发言人", "Label Speakers"), systemImage: "person.2")
+            }
+            .disabled(viewModel.speakerNamingOptions.isEmpty)
+        }
     }
 
     private var titleActionButtons: some View {
@@ -1349,6 +1533,255 @@ struct MeetingDetailContentView: View {
 
     private var transcriptView: some View {
         TranscriptListView(displayChunks: viewModel.transcriptDisplayChunks)
+            .safeAreaInset(edge: .top, spacing: 8) {
+                if let display = transcriptProvenanceDisplay {
+                    TranscriptProvenanceBanner(
+                        display: display,
+                        retryTitle: langMgr.t("重试", "Retry")
+                    )
+                }
+            }
+            .frame(minHeight: 0, maxHeight: .infinity, alignment: .top)
+            .layoutPriority(1)
+    }
+
+    private var transcriptProvenanceDisplay: TranscriptProvenanceDisplay? {
+        if viewModel.isStoppingRecording {
+            return TranscriptProvenanceDisplay(
+                icon: "waveform.badge.checkmark",
+                title: langMgr.t("正在保存双声道录音", "Finalizing dual-track recording"),
+                message: langMgr.t(
+                    "当前仍显示本地临时文字；录音文件保存完成后才会开始会后精准转写。",
+                    "Local draft text remains visible. Accurate post-recording transcription starts after the audio file is safely finalized."
+                ),
+                tint: .blue,
+                showsProgress: true
+            )
+        }
+
+        if recordingSessionManager.isRecordingMeeting(viewModel.meeting.id) {
+            return TranscriptProvenanceDisplay(
+                icon: "waveform",
+                title: langMgr.t(
+                    "录制中 · 本地 \(liveTranscriptionEngineName)",
+                    "Recording · Local \(liveTranscriptionEngineName)"
+                ),
+                message: langMgr.t(
+                    "当前是本地实时临时文字。停止后会按设置使用阿里云或本地 Qwen3-ASR 精转。",
+                    "The current text is a local live draft. After stopping, the configured Aliyun or local Qwen3-ASR refinement runs."
+                ),
+                tint: .red,
+                showsProgress: true
+            )
+        }
+
+        if let status = postRecordingTranscription.statusByMeetingID[viewModel.meeting.id] {
+            switch status.phase {
+            case .waiting:
+                return processingDisplay(
+                    status: status,
+                    cloudTitle: langMgr.t("准备中 · 阿里云百炼", "Preparing · Aliyun Bailian"),
+                    cloudMessage: langMgr.t(
+                        "录音已保存在本机，正在准备上传；当前仍显示本地临时文字。",
+                        "The recording is saved locally and is being prepared for upload; local draft text remains visible."
+                    )
+                )
+            case .requestingUploadPolicy:
+                return processingDisplay(
+                    status: status,
+                    cloudTitle: langMgr.t("正在获取上传凭证 · 阿里云百炼", "Requesting upload access · Aliyun Bailian"),
+                    cloudMessage: langMgr.t(
+                        "尚未替换原文；当前仍显示本地临时文字。",
+                        "The transcript has not been replaced; local draft text remains visible."
+                    )
+                )
+            case .uploading:
+                return processingDisplay(
+                    status: status,
+                    cloudTitle: langMgr.t("正在上传双声道录音 · 阿里云百炼", "Uploading dual-track audio · Aliyun Bailian"),
+                    cloudMessage: langMgr.t(
+                        "这是停止录音后的整段文件上传，不是流式在线转写。",
+                        "This uploads the finalized file after recording; it is not live streaming transcription."
+                    )
+                )
+            case .submitting:
+                return processingDisplay(
+                    status: status,
+                    cloudTitle: langMgr.t("上传完成，正在提交云端任务", "Upload complete; submitting cloud job"),
+                    cloudMessage: langMgr.t(
+                        "当前仍显示本地临时文字，完整结果完成后才会安全替换。",
+                        "Local draft text stays visible until the complete result is ready for a safe replacement."
+                    )
+                )
+            case .polling:
+                return processingDisplay(
+                    status: status,
+                    cloudTitle: langMgr.t("云端转写中 · 阿里云百炼", "Cloud transcription in progress · Aliyun Bailian"),
+                    cloudMessage: langMgr.t(
+                        "软件正在等待完整结果；不是逐句静默替换，完成后会一次性合并本次录音区间。",
+                        "The app is waiting for the complete result. It does not silently replace sentence by sentence; the session range is merged once complete."
+                    )
+                )
+            case .downloadingResult:
+                return processingDisplay(
+                    status: status,
+                    cloudTitle: langMgr.t("正在下载并校验精准结果", "Downloading and validating accurate result"),
+                    cloudMessage: langMgr.t(
+                        "校验和本地保存成功后才会显示“已完成”。",
+                        "Completion is shown only after validation and a successful local save."
+                    )
+                )
+            case .failed:
+                return TranscriptProvenanceDisplay(
+                    icon: "exclamationmark.triangle.fill",
+                    title: status.engine == .aliyunCloud
+                        ? langMgr.t("阿里云精转未完成 · 已保留本地文字", "Aliyun refinement incomplete · local text retained")
+                        : langMgr.t("本地 Qwen3-ASR 精转未完成", "Local Qwen3-ASR refinement incomplete"),
+                    message: status.message ?? langMgr.t(
+                        "录音和本地实时文字都已保留，可以稍后重试。",
+                        "The recording and local live transcript were retained and can be retried later."
+                    ),
+                    tint: .orange,
+                    retryAction: {
+                        postRecordingTranscription.retryLatest(for: viewModel.meeting.id)
+                    }
+                )
+            case .succeeded:
+                if let receipt = viewModel.meeting.accurateTranscriptReceipts.first(where: {
+                    $0.artifactID == status.artifactID
+                }) {
+                    return completedDisplay(
+                        engine: receipt.engine,
+                        modelName: receipt.modelName,
+                        range: transcriptRangeLabel(
+                            start: receipt.replacementStartMilliseconds,
+                            end: receipt.replacementEndMilliseconds
+                        ),
+                        fallbackMessage: nil
+                    )
+                }
+                return completedDisplay(
+                    engine: status.engine,
+                    modelName: status.engine == .aliyunCloud
+                        ? "qwen-audio-3.0-asr-flash-filetrans"
+                        : "Qwen3-ASR-0.6B INT8",
+                    range: nil,
+                    fallbackMessage: status.message
+                )
+            }
+        }
+
+        if let receipt = viewModel.meeting.latestAccurateTranscriptReceipt {
+            return completedDisplay(
+                engine: receipt.engine,
+                modelName: receipt.modelName,
+                range: transcriptRangeLabel(
+                    start: receipt.replacementStartMilliseconds,
+                    end: receipt.replacementEndMilliseconds
+                ),
+                fallbackMessage: nil
+            )
+        }
+
+        guard !viewModel.meeting.transcriptChunks.isEmpty else { return nil }
+        if viewModel.meeting.transcriptionProvenanceVersion == 0
+            || viewModel.meeting.transcriptRevision > 0 {
+            return TranscriptProvenanceDisplay(
+                icon: "questionmark.circle",
+                title: langMgr.t("旧记录 · 原文来源未记录", "Legacy record · transcript source not recorded"),
+                message: langMgr.t(
+                    "这条会议是在增加来源回执前创建或处理的，无法可靠判断来自阿里云、本地实时还是本地离线模型；新录音会永久记录精准转写来源。",
+                    "This meeting predates provenance receipts, so its Aliyun, local-live, or local-file origin cannot be determined reliably. New recordings persist accurate-transcription provenance."
+                ),
+                tint: .secondary
+            )
+        }
+
+        return TranscriptProvenanceDisplay(
+            icon: "laptopcomputer",
+            title: langMgr.t("当前原文 · 本地转写结果", "Current transcript · local result"),
+            message: langMgr.t(
+                "这条原文尚未应用会后精准转写，可能来自录制时的本地实时模型或本地文件导入。“mic / system”只表示音频轨道。",
+                "No accurate post-recording transcript has been applied. This text may come from local live recording or local file import; “mic / system” only identifies the audio track."
+            ),
+            tint: .blue
+        )
+    }
+
+    private func processingDisplay(
+        status: AliyunCloudTranscriptionStatus,
+        cloudTitle: String,
+        cloudMessage: String
+    ) -> TranscriptProvenanceDisplay {
+        if status.engine == .localQwen3 {
+            return TranscriptProvenanceDisplay(
+                icon: "cpu",
+                title: langMgr.t("本地精转中 · Qwen3-ASR", "Local refinement · Qwen3-ASR"),
+                message: status.message ?? langMgr.t(
+                    "当前仍显示本地实时文字，完整本地结果完成后会合并本次录音区间。",
+                    "Local live text remains visible until the complete local result is merged for this session."
+                ),
+                tint: .purple,
+                showsProgress: true
+            )
+        }
+        return TranscriptProvenanceDisplay(
+            icon: "icloud.and.arrow.up",
+            title: cloudTitle,
+            message: status.message ?? cloudMessage,
+            tint: .blue,
+            showsProgress: true
+        )
+    }
+
+    private func completedDisplay(
+        engine: AccurateTranscriptionEngine,
+        modelName: String,
+        range: String?,
+        fallbackMessage: String?
+    ) -> TranscriptProvenanceDisplay {
+        let engineName = engine == .aliyunCloud ? "阿里云百炼" : "本地 Qwen3-ASR"
+        let rangeText = range.map { " · \($0)" } ?? ""
+        let defaultMessage = langMgr.t(
+            "最近一次录音区间已由 \(engineName)（\(modelName)）精转\(rangeText)。精准结果未覆盖的空隙仍保留本地实时文字。",
+            "The latest recording range was refined by \(engineName) (\(modelName))\(rangeText). Gaps not covered by the accurate result retain local live text."
+        )
+        return TranscriptProvenanceDisplay(
+            icon: "checkmark.seal.fill",
+            title: engine == .aliyunCloud
+                ? langMgr.t("已完成 · 阿里云百炼精准转写", "Complete · Aliyun Bailian accurate transcript")
+                : langMgr.t("已完成 · 本地 Qwen3-ASR 精准转写", "Complete · Local Qwen3-ASR accurate transcript"),
+            message: fallbackMessage ?? defaultMessage,
+            tint: .green
+        )
+    }
+
+    private var liveTranscriptionEngineName: String {
+        let engine = recordingSessionManager.activeSTTEngine(for: viewModel.meeting.id)
+            ?? UserDefaultsManager.shared.sttEngine
+        switch engine {
+        case .sherpaSenseVoice:
+            return "SenseVoice"
+        case .funASRNano:
+            return "Fun-ASR-Nano"
+        case .appleSpeechAnalyzer:
+            return langMgr.t("macOS 内置", "macOS SpeechAnalyzer")
+        }
+    }
+
+    private func transcriptRangeLabel(start: Int, end: Int) -> String {
+        "\(transcriptTimeLabel(start))–\(transcriptTimeLabel(end))"
+    }
+
+    private func transcriptTimeLabel(_ milliseconds: Int) -> String {
+        let totalSeconds = max(0, milliseconds) / 1_000
+        let hours = totalSeconds / 3_600
+        let minutes = (totalSeconds % 3_600) / 60
+        let seconds = totalSeconds % 60
+        if hours > 0 {
+            return String(format: "%02d:%02d:%02d", hours, minutes, seconds)
+        }
+        return String(format: "%02d:%02d", minutes, seconds)
     }
 
     private var enhancedNotesView: some View {
@@ -1581,20 +2014,20 @@ private struct WindowAppearanceSync: NSViewRepresentable {
     }
 }
 
-private struct WindowWidthReader: NSViewRepresentable {
+private struct AvailableWidthReader: NSViewRepresentable {
     @Binding var width: CGFloat
 
     func makeCoordinator() -> Coordinator {
         Coordinator(width: $width)
     }
 
-    func makeNSView(context: Context) -> WindowWidthReportingView {
-        let view = WindowWidthReportingView(frame: .zero)
+    func makeNSView(context: Context) -> AvailableWidthReportingView {
+        let view = AvailableWidthReportingView(frame: .zero)
         view.onWidthChange = context.coordinator.updateWidth
         return view
     }
 
-    func updateNSView(_ nsView: WindowWidthReportingView, context: Context) {
+    func updateNSView(_ nsView: AvailableWidthReportingView, context: Context) {
         context.coordinator.width = $width
         nsView.onWidthChange = context.coordinator.updateWidth
         nsView.reportWidth()
@@ -1608,37 +2041,33 @@ private struct WindowWidthReader: NSViewRepresentable {
         }
 
         func updateWidth(_ newWidth: CGFloat) {
+            guard abs(width.wrappedValue - newWidth) >= 0.5 else { return }
             width.wrappedValue = newWidth
         }
     }
 }
 
-private final class WindowWidthReportingView: NSView {
+private final class AvailableWidthReportingView: NSView {
     var onWidthChange: ((CGFloat) -> Void)?
-    private var resizeObserver: NSObjectProtocol?
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        resizeObserver.map(NotificationCenter.default.removeObserver)
-        resizeObserver = nil
-
-        guard let window else { return }
         reportWidth()
-        resizeObserver = NotificationCenter.default.addObserver(
-            forName: NSWindow.didResizeNotification,
-            object: window,
-            queue: .main
-        ) { [weak self] _ in
-            self?.reportWidth()
-        }
     }
 
-    deinit {
-        resizeObserver.map(NotificationCenter.default.removeObserver)
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        reportWidth()
+    }
+
+    override func layout() {
+        super.layout()
+        reportWidth()
     }
 
     func reportWidth() {
-        guard let width = window?.frame.width else { return }
+        let width = bounds.width
+        guard width.isFinite, width > 0 else { return }
         DispatchQueue.main.async { [weak self] in
             self?.onWidthChange?(width)
         }

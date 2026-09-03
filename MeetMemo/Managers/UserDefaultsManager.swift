@@ -37,6 +37,7 @@ class UserDefaultsManager {
         static let sttLocaleIdentifier = "sttLocaleIdentifier"
         static let enableSystemAudioSTT = "enableSystemAudioSTT"
         static let sttEngine = "sttEngine"
+        static let cloudTranscriptionMode = "cloudTranscriptionMode"
         static let sherpaSTTDebugLogging = "sherpaSTTDebugLogging"
         static let voiceInputEnabled = "voiceInputEnabled"
         static let voiceInputTriggerMode = "voiceInputTriggerMode"
@@ -166,6 +167,25 @@ class UserDefaultsManager {
             return STTEngine(rawValue: raw) ?? .sherpaSenseVoice
         }
         set { userDefaults.set(newValue.rawValue, forKey: Keys.sttEngine) }
+    }
+
+    // MARK: - Post-recording accurate transcription
+
+    var cloudTranscriptionMode: CloudTranscriptionMode {
+        get {
+            let raw = userDefaults.string(forKey: Keys.cloudTranscriptionMode)
+                ?? CloudTranscriptionMode.localOnly.rawValue
+            return CloudTranscriptionMode(rawValue: raw) ?? .localOnly
+        }
+        set {
+            let previousValue = cloudTranscriptionMode
+            userDefaults.set(newValue.rawValue, forKey: Keys.cloudTranscriptionMode)
+            guard previousValue != newValue else { return }
+            NotificationCenter.default.post(
+                name: .cloudTranscriptionModeChanged,
+                object: newValue
+            )
+        }
     }
 
     // MARK: - Dual STT (mic + system audio)

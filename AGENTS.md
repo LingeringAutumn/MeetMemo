@@ -4,7 +4,7 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 
 ## Project Overview
 
-MeetMemo (MeetMemo) is a free, open-source macOS AI meeting notetaker. It captures mic + system audio, transcribes locally through a pluggable STT engine (Apple SpeechAnalyzer or sherpa-onnx SenseVoice), and generates structured notes via the configured LLM provider.
+MeetMemo is a source-available, noncommercial macOS AI meeting notetaker under PolyForm Noncommercial 1.0.0. It captures mic + system audio, transcribes locally through pluggable STT engines, and generates structured notes via the configured LLM provider.
 
 Primary project:
 - `MeetMemo/` — Native Swift/SwiftUI macOS app
@@ -18,7 +18,7 @@ Build from command line (do **not** run the app after building):
 xcodebuild -project MeetMemo.xcodeproj -scheme MeetMemo -configuration Debug build
 ```
 
-Release build (requires `.env` with `DEVELOPER_ID`, `APPLE_ID`, `TEAM_ID`, `APP_PASSWORD`):
+Release build (requires a chmod-600 `.env` with `DEVELOPER_ID` and `NOTARY_PROFILE`; store Apple notarization credentials interactively in the macOS Keychain with `notarytool store-credentials`):
 ```bash
 ./scripts/build_release.sh
 ```

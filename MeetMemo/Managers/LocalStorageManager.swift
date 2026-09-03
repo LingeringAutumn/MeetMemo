@@ -3,6 +3,104 @@
 
 import Foundation
 
+/// Replaces only the portions of a source timeline that an accurate recognizer actually
+/// returned. Missing channels and quality-gated holes intentionally retain the live draft.
+enum AccurateTranscriptReplacement {
+    private struct CoverageSpan {
+        var start: Int
+        var end: Int
+    }
+
+    static func merging(
+        existing: [TranscriptChunk],
+        replacement: [TranscriptChunk],
+        replacementStartMilliseconds: Int,
+        replacementEndMilliseconds: Int,
+        boundaryToleranceMilliseconds: Int = 500
+    ) -> [TranscriptChunk] {
+        let rangeStart = max(0, replacementStartMilliseconds)
+        let rangeEnd = max(rangeStart, replacementEndMilliseconds)
+        guard rangeEnd > rangeStart else { return existing.sortedByTranscriptTimeline() }
+        let tolerance = max(0, boundaryToleranceMilliseconds)
+        var exactCoverageBySource: [AudioSource: [CoverageSpan]] = [:]
+
+        for chunk in replacement {
+            guard let start = chunk.startTime, let end = chunk.endTime, end >= start else { continue }
+            let exactStart = max(rangeStart, start)
+            let exactEnd = min(rangeEnd, end)
+            guard exactEnd > exactStart else { continue }
+            exactCoverageBySource[chunk.source, default: []].append(CoverageSpan(
+                start: exactStart,
+                end: exactEnd
+            ))
+        }
+
+        var toleratedCoverageBySource: [AudioSource: [CoverageSpan]] = [:]
+        for source in Array(exactCoverageBySource.keys) {
+            let sorted = exactCoverageBySource[source, default: []].sorted { lhs, rhs in
+                lhs.start == rhs.start ? lhs.end < rhs.end : lhs.start < rhs.start
+            }
+            var merged: [CoverageSpan] = []
+            for span in sorted {
+                guard var last = merged.popLast() else {
+                    merged.append(span)
+                    continue
+                }
+                // Merge only spans that genuinely overlap. Bridging a recognition
+                // gap would delete useful live draft text rejected by the quality gate.
+                if span.start <= last.end {
+                    last.end = max(last.end, span.end)
+                    merged.append(last)
+                } else {
+                    merged.append(last)
+                    merged.append(span)
+                }
+            }
+            exactCoverageBySource[source] = merged
+
+            // Apply boundary jitter tolerance only to the outer edges of each real
+            // connected component. Expanding each accurate chunk before merging can
+            // bridge a quality-gated hole and make an old chunk look fully covered.
+            // Keep the expanded components separate even if their tolerated edges
+            // overlap; an internal hole must never become replacement coverage.
+            toleratedCoverageBySource[source] = merged.compactMap { span in
+                let expandedStart = max(rangeStart, span.start - min(span.start, tolerance))
+                let (expandedEnd, overflow) = span.end.addingReportingOverflow(tolerance)
+                let boundedEnd = min(rangeEnd, overflow ? Int.max : expandedEnd)
+                guard boundedEnd > expandedStart else { return nil }
+                return CoverageSpan(start: expandedStart, end: boundedEnd)
+            }
+        }
+
+        var result = existing.filter { chunk in
+            guard let spans = toleratedCoverageBySource[chunk.source], !spans.isEmpty,
+                  let rawStart = chunk.startTime ?? chunk.endTime,
+                  let rawEnd = chunk.endTime ?? chunk.startTime else {
+                return true
+            }
+            let start = min(rawStart, rawEnd)
+            let end = max(rawStart, rawEnd)
+            guard let exactSpans = exactCoverageBySource[chunk.source] else { return true }
+
+            // Chunks are the smallest durable unit, so a partial overwrite cannot be
+            // represented without inventing word-level timestamps. Delete an old chunk
+            // only when an accurate span really overlaps it and its expanded boundary
+            // fully contains the old chunk. For partial overlap, preserving a possible
+            // duplicate is safer than losing the uncovered words on either side.
+            let hasPositiveExactOverlap = exactSpans.contains { span in
+                max(start, span.start) < min(end, span.end)
+            }
+            let isFullyCovered = spans.contains { span in
+                start >= span.start && end <= span.end
+            }
+            return !(hasPositiveExactOverlap && isFullyCovered)
+        }
+        result.append(contentsOf: replacement)
+        result.sortByTranscriptTimeline()
+        return result
+    }
+}
+
 /// Manages local file storage for meetings and app data
 class LocalStorageManager {
     static let shared = LocalStorageManager()
@@ -67,14 +165,29 @@ class LocalStorageManager {
         }
     }
 
-    private func saveMeetingLocked(_ meeting: Meeting) -> Bool {
+    private func saveMeetingLocked(
+        _ meeting: Meeting,
+        preserveMissingFinalChunks: Bool = true
+    ) -> Bool {
         guard !deletedMeetingIDs.contains(meeting.id) else {
             print("🚫 Skipping save for deleted meeting: \(meeting.id)")
             return false
         }
 
         let fileURL = meetingsDirectory.appendingPathComponent("\(meeting.id.uuidString).json")
-        var meetingToSave = mergedMeetingForSave(meeting, fileURL: fileURL)
+        var meetingToSave = mergedMeetingForSave(
+            meeting,
+            fileURL: fileURL,
+            preserveMissingFinalChunks: preserveMissingFinalChunks
+        )
+        if meetingToSave.transcriptChunks.contains(where: { $0.source == .mic && $0.speakerTag == "candidate" }) {
+            meetingToSave.speakerNameMappings["MIC:candidate"] =
+                meetingToSave.speakerNameMappings["MIC:candidate"] ?? "候选人"
+        }
+        if meetingToSave.transcriptChunks.contains(where: { $0.source == .system && $0.speakerTag == "interviewer" }) {
+            meetingToSave.speakerNameMappings["SYS:interviewer"] =
+                meetingToSave.speakerNameMappings["SYS:interviewer"] ?? "面试官"
+        }
         meetingToSave.syncLegacyUserNotesFromContext()
         meetingToSave.dataVersion = Meeting.currentDataVersion
 
@@ -96,19 +209,118 @@ class LocalStorageManager {
         }
     }
 
-    private func mergedMeetingForSave(_ incoming: Meeting, fileURL: URL) -> Meeting {
+    private func mergedMeetingForSave(
+        _ incoming: Meeting,
+        fileURL: URL,
+        preserveMissingFinalChunks: Bool
+    ) -> Meeting {
         guard FileManager.default.fileExists(atPath: fileURL.path) else {
             return incoming
         }
 
-        guard let existing = loadMeetingFromFileLocked(fileURL) else {
+        guard preserveMissingFinalChunks,
+              let existing = loadMeetingFromFileLocked(fileURL) else {
             return incoming
         }
 
-        var merged = incoming
-        merged.transcriptChunks = incoming.transcriptChunks
-            .mergingTranscriptCorrections(preservingMissingFinalChunksFrom: existing.transcriptChunks)
-        return merged
+        return incoming.mergingForPersistence(
+            with: existing,
+            preserveMissingFinalChunks: preserveMissingFinalChunks
+        )
+    }
+
+    /// Atomically replaces only the recording session represented by an accurate-transcription
+    /// delivery. Delivered chunks are already on the absolute meeting timeline; this method deliberately
+    /// bypasses the normal "preserve missing chunks" merge so superseded local chunks are
+    /// not resurrected from disk. A failed save leaves the original meeting file untouched.
+    func applyAliyunCloudTranscription(_ delivery: AliyunCloudTranscriptionDelivery) -> Meeting? {
+        withStorageLock {
+            guard var meeting = loadMeetingLocked(id: delivery.meetingID),
+                  let replacementEnd = delivery.replacementEndMilliseconds,
+                  replacementEnd > delivery.replacementStartMilliseconds else {
+                return nil
+            }
+
+            let replacementStart = delivery.replacementStartMilliseconds
+            let (toleratedEnd, endOverflow) = replacementEnd.addingReportingOverflow(1_000)
+            let maximumAcceptedEnd = endOverflow ? Int.max : toleratedEnd
+            let replacementChunks = delivery.result.chunks.compactMap { chunk -> TranscriptChunk? in
+                guard let start = chunk.startTime, let end = chunk.endTime else { return nil }
+                guard end >= start,
+                      start < replacementEnd,
+                      end > replacementStart,
+                      end <= maximumAcceptedEnd else {
+                    return nil
+                }
+                let boundedStart = max(replacementStart, start)
+                let boundedEnd = min(replacementEnd, end)
+                guard boundedEnd > boundedStart else { return nil }
+                guard boundedStart != start || boundedEnd != end else { return chunk }
+                let (timestampOffset, timestampOffsetOverflow) = boundedStart
+                    .subtractingReportingOverflow(start)
+                return TranscriptChunk(
+                    id: chunk.id,
+                    timestamp: chunk.timestamp.addingTimeInterval(
+                        Double(timestampOffsetOverflow ? 0 : max(0, timestampOffset)) / 1_000
+                    ),
+                    source: chunk.source,
+                    text: chunk.text,
+                    isFinal: chunk.isFinal,
+                    speakerTag: chunk.speakerTag,
+                    speakerId: chunk.speakerId,
+                    startTime: boundedStart,
+                    endTime: boundedEnd,
+                    isLowConfidence: chunk.isLowConfidence
+                )
+            }
+            guard !replacementChunks.isEmpty else { return nil }
+
+            // A dual-channel job can return only one populated channel, and the local
+            // quality gate can deliberately omit a bad segment. Replace only the sources
+            // and time spans for which accurate chunks exist so neither case deletes useful
+            // live text from the other channel or from an uncovered hole.
+            meeting.transcriptChunks = AccurateTranscriptReplacement.merging(
+                existing: meeting.transcriptChunks,
+                replacement: replacementChunks,
+                replacementStartMilliseconds: replacementStart,
+                replacementEndMilliseconds: replacementEnd
+            )
+            if meeting.transcriptRevision < Int.max {
+                meeting.transcriptRevision += 1
+            }
+            // Keep explicit user names; cloud/local accurate engines only provide
+            // defaults for stable source roles and must not silently rename people.
+            meeting.speakerNameMappings.merge(delivery.result.speakerNameMappings) { existingName, _ in
+                existingName
+            }
+
+            let receipt = AccurateTranscriptReceipt(
+                artifactID: delivery.artifactID,
+                recordingSessionID: delivery.recordingSessionID,
+                engine: delivery.engine,
+                modelName: delivery.modelName,
+                replacementStartMilliseconds: replacementStart,
+                replacementEndMilliseconds: replacementEnd
+            )
+            meeting.accurateTranscriptReceipts.removeAll { $0.artifactID == receipt.artifactID }
+            meeting.accurateTranscriptReceipts.append(receipt)
+            meeting.accurateTranscriptReceipts.sort { lhs, rhs in
+                if lhs.replacementStartMilliseconds != rhs.replacementStartMilliseconds {
+                    return lhs.replacementStartMilliseconds < rhs.replacementStartMilliseconds
+                }
+                return lhs.completedAt < rhs.completedAt
+            }
+            meeting.transcriptionProvenanceVersion = max(
+                1,
+                meeting.transcriptionProvenanceVersion
+            )
+
+            guard saveMeetingLocked(meeting, preserveMissingFinalChunks: false) else { return nil }
+            // saveMeetingLocked normalizes default role mappings, legacy context,
+            // and dataVersion before writing. Return that canonical persisted value
+            // so the notification/UI cannot temporarily disagree with disk.
+            return loadMeetingLocked(id: meeting.id) ?? meeting
+        }
     }
     
     /// Loads all meetings from local storage
@@ -339,6 +551,8 @@ class LocalStorageManager {
             print("✅ Deleted meeting: \(meetingId)")
             return true
         } catch {
+            // A partial filesystem failure must not permanently block a later retry.
+            deletedMeetingIDs.remove(meetingId)
             print("❌ Failed to delete meeting: \(error)")
             return false
         }

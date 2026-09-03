@@ -34,57 +34,125 @@ final class SherpaOnnxRuntime: @unchecked Sendable {
 #if SHERPA_ONNX_ENABLED
     private let recognizer: SherpaOnnxOfflineRecognizer
     private let vad: SherpaOnnxVoiceActivityDetectorWrapper
-    private let embeddingExtractor: SherpaOnnxSpeakerEmbeddingExtractorWrapper
+    private let embeddingExtractor: SherpaOnnxSpeakerEmbeddingExtractorWrapper?
+    private let recoveryRecognizer: SherpaOnnxOfflineRecognizer?
 
     private init(
         recognizer: SherpaOnnxOfflineRecognizer,
         vad: SherpaOnnxVoiceActivityDetectorWrapper,
-        embeddingExtractor: SherpaOnnxSpeakerEmbeddingExtractorWrapper
+        embeddingExtractor: SherpaOnnxSpeakerEmbeddingExtractorWrapper?,
+        recoveryRecognizer: SherpaOnnxOfflineRecognizer? = nil
     ) {
         self.recognizer = recognizer
         self.vad = vad
         self.embeddingExtractor = embeddingExtractor
+        self.recoveryRecognizer = recoveryRecognizer
     }
 
-    static func make(modelDirectory: URL, senseVoiceModelFileName: String) throws -> SherpaOnnxRuntime {
+    static func make(
+        modelDirectory: URL,
+        senseVoiceModelFileName: String,
+        enableSpeakerEmbedding: Bool = true
+    ) throws -> SherpaOnnxRuntime {
         let modelPath = modelDirectory.appendingPathComponent(senseVoiceModelFileName).path
         let tokensPath = modelDirectory.appendingPathComponent("tokens.txt").path
         let vadPath = modelDirectory.appendingPathComponent("silero-vad.onnx").path
         let embPath = modelDirectory.appendingPathComponent("3dspeaker-cam-plus.onnx").path
 
-        for path in [modelPath, tokensPath, vadPath, embPath] {
+        var requiredPaths = [modelPath, tokensPath, vadPath]
+        if enableSpeakerEmbedding { requiredPaths.append(embPath) }
+        for path in requiredPaths {
             guard FileManager.default.fileExists(atPath: path) else {
                 throw SherpaOnnxRuntimeError.modelFileMissing(path)
             }
         }
 
-        // SenseVoice offline recognizer.
-        let senseVoiceCfg = sherpaOnnxOfflineSenseVoiceModelConfig(
-            model: modelPath,
-            language: "auto",
-            useInverseTextNormalization: true
-        )
-        let modelCfg = sherpaOnnxOfflineModelConfig(
-            tokens: tokensPath,
-            numThreads: 2,
-            provider: "cpu",
-            debug: 0,
-            modelType: "sense_voice",
-            senseVoice: senseVoiceCfg
-        )
-        let featCfg = sherpaOnnxFeatureConfig(sampleRate: 16_000, featureDim: 80)
-        var recognizerCfg = sherpaOnnxOfflineRecognizerConfig(
-            featConfig: featCfg,
-            modelConfig: modelCfg,
-            decodingMethod: "greedy_search"
-        )
-        let recognizer = withUnsafePointer(to: &recognizerCfg) { ptr in
-            SherpaOnnxOfflineRecognizer(config: ptr)
-        }
+        let recognizer = Self.makeSenseVoiceRecognizer(modelPath: modelPath, tokensPath: tokensPath)
 
         let vad = Self.makeVad(vadPath: vadPath)
-        let emb = Self.makeSpeakerEmbeddingExtractor(modelPath: embPath)
+        let emb = enableSpeakerEmbedding
+            ? Self.makeSpeakerEmbeddingExtractor(modelPath: embPath)
+            : nil
         return SherpaOnnxRuntime(recognizer: recognizer, vad: vad, embeddingExtractor: emb)
+    }
+
+    /// Qwen3-ASR-0.6B INT8 recognizer used by the post-recording single-track path.
+    /// A SenseVoice session is loaded alongside it solely as a non-generative recovery
+    /// decoder when the output quality gate detects a repetition loop or hallucination.
+    static func makeQwen3ASR(
+        modelDirectory: URL,
+        hotwords: String = ""
+    ) throws -> SherpaOnnxRuntime {
+        let qwenDirectory = modelDirectory.appendingPathComponent("qwen3-asr", isDirectory: true)
+        let convFrontendPath = qwenDirectory.appendingPathComponent("conv_frontend.onnx").path
+        let encoderPath = qwenDirectory.appendingPathComponent("encoder.int8.onnx").path
+        let decoderPath = qwenDirectory.appendingPathComponent("decoder.int8.onnx").path
+        let tokenizerDirectory = qwenDirectory.appendingPathComponent("tokenizer", isDirectory: true)
+        let tokenizerPath = tokenizerDirectory.path
+        let tokenizerFiles = ["merges.txt", "tokenizer_config.json", "vocab.json"]
+            .map { tokenizerDirectory.appendingPathComponent($0).path }
+        let vadPath = modelDirectory.appendingPathComponent("silero-vad.onnx").path
+        let fallbackModelPath = modelDirectory
+            .appendingPathComponent("sense-voice-small.int8.onnx").path
+        let fallbackTokensPath = modelDirectory.appendingPathComponent("tokens.txt").path
+
+        for path in [
+            convFrontendPath,
+            encoderPath,
+            decoderPath,
+            vadPath,
+            fallbackModelPath,
+            fallbackTokensPath,
+        ] + tokenizerFiles {
+            guard FileManager.default.fileExists(atPath: path) else {
+                throw SherpaOnnxRuntimeError.modelFileMissing(path)
+            }
+        }
+
+        let qwenConfig = sherpaOnnxOfflineQwen3ASRModelConfig(
+            convFrontend: convFrontendPath,
+            encoder: encoderPath,
+            decoder: decoderPath,
+            tokenizer: tokenizerPath,
+            maxTotalLen: 512,
+            // VAD bounds each utterance to 15 seconds. 192 tokens leave ample room for
+            // fast Mandarin/English while placing a hard ceiling on a generation loop.
+            maxNewTokens: 192,
+            temperature: 1e-6,
+            topP: 0.8,
+            seed: 42,
+            hotwords: hotwords
+        )
+        let modelConfig = sherpaOnnxOfflineModelConfig(
+            tokens: "",
+            numThreads: 3,
+            provider: "cpu",
+            debug: 0,
+            qwen3Asr: qwenConfig
+        )
+        let featureConfig = sherpaOnnxFeatureConfig(sampleRate: 16_000, featureDim: 80)
+        var recognizerConfig = sherpaOnnxOfflineRecognizerConfig(
+            featConfig: featureConfig,
+            modelConfig: modelConfig,
+            decodingMethod: "greedy_search"
+        )
+        let recognizer = withUnsafePointer(to: &recognizerConfig) { pointer in
+            SherpaOnnxOfflineRecognizer(config: pointer)
+        }
+
+        let recoveryRecognizer = Self.makeSenseVoiceRecognizer(
+            modelPath: fallbackModelPath,
+            tokensPath: fallbackTokensPath
+        )
+        let vad = Self.makeVad(vadPath: vadPath)
+        // Interview roles come from the physical mic/system tracks. Deliberately omit
+        // CAM++ here so Qwen never manufactures speaker IDs for one-to-one recordings.
+        return SherpaOnnxRuntime(
+            recognizer: recognizer,
+            vad: vad,
+            embeddingExtractor: nil,
+            recoveryRecognizer: recoveryRecognizer
+        )
     }
 
     /// Fun-ASR-Nano offline recognizer + the same Silero VAD / CAM++ pipeline used by
@@ -93,7 +161,8 @@ final class SherpaOnnxRuntime: @unchecked Sendable {
     static func makeFunASRNano(
         modelDirectory: URL,
         language: String = "",
-        hotwords: String = ""
+        hotwords: String = "",
+        enableSpeakerEmbedding: Bool = true
     ) throws -> SherpaOnnxRuntime {
         let funDir = modelDirectory.appendingPathComponent("funasr-nano", isDirectory: true)
         let encoderPath = funDir.appendingPathComponent("encoder_adaptor.int8.onnx").path
@@ -103,7 +172,9 @@ final class SherpaOnnxRuntime: @unchecked Sendable {
         let vadPath = modelDirectory.appendingPathComponent("silero-vad.onnx").path
         let spkPath = modelDirectory.appendingPathComponent("3dspeaker-cam-plus.onnx").path
 
-        for path in [encoderPath, llmPath, embeddingPath, tokenizerDir, vadPath, spkPath] {
+        var requiredPaths = [encoderPath, llmPath, embeddingPath, tokenizerDir, vadPath]
+        if enableSpeakerEmbedding { requiredPaths.append(spkPath) }
+        for path in requiredPaths {
             guard FileManager.default.fileExists(atPath: path) else {
                 throw SherpaOnnxRuntimeError.modelFileMissing(path)
             }
@@ -137,7 +208,9 @@ final class SherpaOnnxRuntime: @unchecked Sendable {
         }
 
         let vad = Self.makeVad(vadPath: vadPath)
-        let emb = Self.makeSpeakerEmbeddingExtractor(modelPath: spkPath)
+        let emb = enableSpeakerEmbedding
+            ? Self.makeSpeakerEmbeddingExtractor(modelPath: spkPath)
+            : nil
         return SherpaOnnxRuntime(recognizer: recognizer, vad: vad, embeddingExtractor: emb)
     }
 
@@ -176,6 +249,34 @@ final class SherpaOnnxRuntime: @unchecked Sendable {
         }
     }
 
+    private static func makeSenseVoiceRecognizer(
+        modelPath: String,
+        tokensPath: String
+    ) -> SherpaOnnxOfflineRecognizer {
+        let senseVoiceConfig = sherpaOnnxOfflineSenseVoiceModelConfig(
+            model: modelPath,
+            language: "auto",
+            useInverseTextNormalization: true
+        )
+        let modelConfig = sherpaOnnxOfflineModelConfig(
+            tokens: tokensPath,
+            numThreads: 2,
+            provider: "cpu",
+            debug: 0,
+            modelType: "sense_voice",
+            senseVoice: senseVoiceConfig
+        )
+        let featureConfig = sherpaOnnxFeatureConfig(sampleRate: 16_000, featureDim: 80)
+        var recognizerConfig = sherpaOnnxOfflineRecognizerConfig(
+            featConfig: featureConfig,
+            modelConfig: modelConfig,
+            decodingMethod: "greedy_search"
+        )
+        return withUnsafePointer(to: &recognizerConfig) { pointer in
+            SherpaOnnxOfflineRecognizer(config: pointer)
+        }
+    }
+
     func acceptWaveform(_ samples: [Float]) {
         vad.acceptWaveform(samples: samples)
     }
@@ -211,7 +312,22 @@ final class SherpaOnnxRuntime: @unchecked Sendable {
         )
     }
 
+    /// Re-decodes the same time-aligned PCM with the non-generative recovery model.
+    /// The returned offsets are unchanged, so a fallback cannot compress either track's
+    /// timeline or disturb a later mic/system merge.
+    func decodeRecoverySegment(samples: [Float], startSampleOffset: Int) -> Segment? {
+        guard let recoveryRecognizer else { return nil }
+        let result = recoveryRecognizer.decode(samples: samples, sampleRate: 16_000)
+        return Segment(
+            samples: samples,
+            text: result.text,
+            startSampleOffset: startSampleOffset,
+            endSampleOffset: startSampleOffset + samples.count
+        )
+    }
+
     func embedding(for samples: [Float]) -> [Float] {
+        guard let embeddingExtractor else { return [] }
         let stream = embeddingExtractor.createStream()
         stream.acceptWaveform(samples: samples, sampleRate: 16_000)
         stream.inputFinished()
@@ -219,9 +335,33 @@ final class SherpaOnnxRuntime: @unchecked Sendable {
         return embeddingExtractor.compute(stream: stream)
     }
 #else
-    static func make(modelDirectory: URL, senseVoiceModelFileName: String) throws -> SherpaOnnxRuntime {
+    static func make(
+        modelDirectory: URL,
+        senseVoiceModelFileName: String,
+        enableSpeakerEmbedding: Bool = true
+    ) throws -> SherpaOnnxRuntime {
         _ = modelDirectory
         _ = senseVoiceModelFileName
+        _ = enableSpeakerEmbedding
+        throw SherpaOnnxRuntimeError.frameworkUnavailable
+    }
+
+    static func makeQwen3ASR(modelDirectory: URL, hotwords: String = "") throws -> SherpaOnnxRuntime {
+        _ = modelDirectory
+        _ = hotwords
+        throw SherpaOnnxRuntimeError.frameworkUnavailable
+    }
+
+    static func makeFunASRNano(
+        modelDirectory: URL,
+        language: String = "",
+        hotwords: String = "",
+        enableSpeakerEmbedding: Bool = true
+    ) throws -> SherpaOnnxRuntime {
+        _ = modelDirectory
+        _ = language
+        _ = hotwords
+        _ = enableSpeakerEmbedding
         throw SherpaOnnxRuntimeError.frameworkUnavailable
     }
 
@@ -235,6 +375,11 @@ final class SherpaOnnxRuntime: @unchecked Sendable {
             startSampleOffset: startSampleOffset,
             endSampleOffset: startSampleOffset + samples.count
         )
+    }
+    func decodeRecoverySegment(samples: [Float], startSampleOffset: Int) -> Segment? {
+        _ = samples
+        _ = startSampleOffset
+        return nil
     }
     func embedding(for samples: [Float]) -> [Float] { _ = samples; return [] }
 #endif
@@ -254,8 +399,8 @@ enum SherpaOnnxRuntimeError: LocalizedError {
             )
         case .modelFileMissing(let path):
             return lang.t(
-                "未找到 sherpa-onnx 模型文件：\(path)。请在设置中重新下载本地 SenseVoice 模型。",
-                "Missing sherpa-onnx model file: \(path). Re-download the local SenseVoice models from Settings."
+                "未找到 sherpa-onnx 模型文件：\(path)。请在设置中重新下载对应的本地语音模型。",
+                "Missing sherpa-onnx model file: \(path). Re-download the corresponding local speech model in Settings."
             )
         }
     }

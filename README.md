@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="https://file.348580.xyz/{year}/{month}/{md5}.{extName}/meetmemo-Q2 (2).png" alt="MeetMemo Logo" width="80" height="80">
+  <img src="docs/assets/meetmemo-icon.png" alt="MeetMemo Logo" width="80" height="80">
 
 
   <h3 align="center">MeetMemo</h3>
@@ -7,21 +7,16 @@
   <p align="center">
     免费、源码公开、运行在本地的 macOS AI 会议纪要助手
     <br />
-    <a href="https://github.com/abcwyc/MeetMemo/releases">下载上游官方 macOS 15.5+ 版本</a>
+    <a href="https://github.com/LingeringAutumn/MeetMemo/releases">前往 Releases 下载非官方测试版</a>
   </p>
 
 </div>
 
-> [!IMPORTANT]
-> 本仓库是基于 [abcwyc/MeetMemo](https://github.com/abcwyc/MeetMemo) 的非官方修改版本，主要改进双路音频时间轴、录音收尾、识别器生命周期和本地构建流程。
-> 项目继续遵循 PolyForm Noncommercial License 1.0.0，仅限非商业用途；原始版权声明和许可证文本已保留。
-> 当前仓库暂未发布独立安装包，下面的下载链接指向上游官方版本，不包含本仓库的修改。
-
 ## 简介
 
-MeetMemo 是一款原生 macOS AI 会议记录工具。它可以同时捕获麦克风和系统音频，在本机完成实时转录，并结合会前资料、系统提示词和自定义模板，调用你自己配置的大模型生成结构化纪要。
+MeetMemo 是一款原生 macOS AI 会议记录工具。它可以同时捕获麦克风和系统音频，在本机完成实时转录，并结合会前资料、系统提示词和自定义模板，调用你自己配置的大模型生成结构化纪要。本修改版还可在录音停止后选择阿里云百炼文件转写；启用时会把本次双声道录音上传至你配置的阿里云账号。
 
-适用于日常会议、站会、1on1、客户访谈、需求评审、招聘面试等场景。所有会议数据保存在本机，语音识别完全离线运行，纪要生成所用的大模型服务由你自行配置——MeetMemo 不提供云端账号，也不会把你的会议数据同步到任何项目方服务器。
+适用于日常会议、站会、1on1、客户访谈、需求评审、招聘面试等场景。会议文件保存在本机；实时语音识别在本地运行。只有当你主动启用阿里云会后精准转写或调用自己配置的纪要大模型时，相应音频或文本才会发送给该服务商。
 
 MeetMemo ：
 
@@ -36,19 +31,20 @@ MeetMemo ：
 
 - 转录原文
 
-![](https://file.348580.xyz/2026/05/780e4b22ec10e6cd1ebaa57582939546.png)
+![](docs/assets/transcript.png)
 - 会议纪要
 
-![](https://file.348580.xyz/{year}/{month}/{md5}.{extName}/123456.png)
+![](docs/assets/meeting-summary.png)
 
 - 自定义会议总结提示词
 
-![](https://file.348580.xyz/2026/05/d0ddc376505f59e3aaadb8a9526ad553.png)
+![](docs/assets/prompt-template.png)
 
 ## 核心特色
 
 - **双路音频录制**：同时录制麦克风与系统音频，分别标记"自己"和"会议中的其他人"。
 - **实时转录**：录制过程中持续接收流式语音识别结果，会议结束后保留完整转录原文，支持中途继续补录。
+- **会后精准转写（可选）**：停止录音后可使用本地 Qwen3-ASR，或上传完整双声道 WAV 到阿里云百炼异步转写；原文页会显示上传、处理、下载和完成来源，云端失败时保留本地文字并自动尝试本地兜底。
 - **本地多引擎语音识别**：转录完全在本机运行，无需 STT API Key。可按场景选择：
   - **SenseVoice（sherpa-onnx）**：约 240MB，小模型、低资源占用，兼容 macOS 15.5+，支持说话人识别；适合作为默认引擎。
   - **Fun-ASR-Nano（sherpa-onnx）**：约 1GB，高精度多语言 / 方言识别，支持说话人识别；更适合重视准确率的会议。
@@ -77,7 +73,7 @@ MeetMemo ：
 
 ### 1. 安装并打开
 
-下载上游官方的 [MeetMemo.dmg](https://github.com/abcwyc/MeetMemo/releases)，安装后打开应用。该安装包不包含本仓库的修改。
+从个人仓库的 [Releases 页面](https://github.com/LingeringAutumn/MeetMemo/releases)选择明确标注为 `MeetMemo Interview` 的版本，下载其中的 Apple Silicon ZIP 与 `SHA256SUMS.txt`。校验 SHA-256 后解压，将 `MeetMemo Interview.app` 拖入“应用程序”。若该 Release 标注为 ad-hoc、未公证测试包，首次启动请在 Finder 中右键应用并选择“打开”。
 
 首次启动会进入引导页，需要完成权限和服务配置。你也可以稍后在「设置」中重新配置。
 
@@ -168,7 +164,7 @@ Kimi 官方:               https://api.moonshot.cn/v1
 - 会议文件、会议摘要和模板保存在本机 Documents 目录下的 `Meetings/`、`MeetingSummaries/`、`Templates/`（沙盒构建下位于应用容器内）。
 - LLM 的 API Key、Base URL、模型名保存在 macOS Keychain。
 - MeetMemo 不提供云端账号系统，也不会把会议数据同步到项目自有服务器。
-- 语音识别在本机离线处理，音频不离开设备；纪要生成、结构化提取和行动项提取会把必要文本发送到你配置的 LLM 服务，请根据你所在组织的合规要求选择服务商。
+- 录制期间的临时语音识别在本机进行。若选择“仅本地”，会后精转也不上传音频；若选择“阿里云精准”，停止后会将本次完整双声道 WAV 发送给阿里云百炼做异步转写。纪要生成、结构化提取和行动项提取会把必要文本发送到你配置的 LLM 服务。
 
 ## 本地开发
 
@@ -186,11 +182,21 @@ xcodebuild -project MeetMemo.xcodeproj -scheme MeetMemo -configuration Debug bui
 ./scripts/fetch_sherpa_frameworks.sh
 ```
 
+只有 Command Line Tools、没有完整 Xcode 时，可构建非公证的 Apple Silicon 测试包：
+
+```bash
+./scripts/build_local_clt.sh
+```
+
+默认输出 `MeetMemo Interview.app` 和 `MeetMemo-Interview-local-macos-arm64.zip`，Bundle ID 为 `io.github.lingeringautumn.meetmemo.interview`，可与上游并排安装。独立 Bundle ID 也意味着它有独立的会议数据、设置、系统权限和 Keychain，不会自动读取旧版数据。
+
+只为本机覆盖旧安装、尝试沿用旧容器数据时，可显式运行 `MEETMEMO_BUILD_PROFILE=compatibility ./scripts/build_local_clt.sh`。该包沿用上游 Bundle ID，但 ad-hoc 签名的代码要求可能与旧安装不同，因此不能保证继承 sandbox、TCC 或 Keychain；覆盖前应备份，且仍可能需要重新授权和重填 Key。兼容包只能私人使用，绝不能作为本 Fork 的 GitHub Release 附件。两个 profile 都会从生成的 ZIP 往返解包，校验身份、签名、架构、entitlements、许可证哈希和 no-TTS 符号，并输出 `SHA256SUMS.txt` 与 `BUILD_VERIFICATION.md`。
+
 项目架构说明详见 [`CLAUDE.md`](CLAUDE.md)。
 
 ## 发布新版本
 
-发布构建需要 `.env` 中配置 `DEVELOPER_ID`、`APPLE_ID`、`TEAM_ID`、`APP_PASSWORD`。
+发布构建需要自己的 Apple Developer ID。先用 `xcrun notarytool store-credentials` 把公证凭据交互式存入 macOS Keychain，再在权限为 `600` 的 `.env` 中只配置 `DEVELOPER_ID` 与 `NOTARY_PROFILE`；不要把 Apple ID 或 app-specific password 写入仓库或命令行参数。
 
 ### 准备
 
@@ -214,11 +220,11 @@ chmod +x scripts/update_version.sh scripts/build_release.sh
 ./scripts/build_release.sh
 ```
 
-脚本会清理并构建 Release 版本（arm64 + x86_64 通用二进制），并创建签名后的 DMG 文件。
+脚本会构建 Release 版本（arm64 + x86_64 通用二进制），验证完整许可证、签名、entitlements 与架构，在隐藏暂存目录完成 Apple 公证、staple 和 Gatekeeper 检查后，才生成正式 DMG、`SHA256SUMS.txt` 与 `BUILD_VERIFICATION.md`。
 
 ### 创建 GitHub Release
 
-1. 打开本仓库的 [GitHub Releases](https://github.com/LingeringAutumn/MeetMemo/releases)。
+1. 打开当前维护仓库的 [GitHub Releases](https://github.com/LingeringAutumn/MeetMemo/releases)。
 2. 创建新 release，tag 使用 `v版本号`，例如 `v0.4`。
 3. 上传 `releases/` 目录下生成的 DMG。
 4. 生成并补充 release notes。
@@ -230,6 +236,8 @@ chmod +x scripts/update_version.sh scripts/build_release.sh
 ## 许可证
 
 MeetMemo 采用 [PolyForm Noncommercial License 1.0.0](LICENSE)（非商业许可）发布。
+
+这是基于 [abcwyc/MeetMemo](https://github.com/abcwyc/MeetMemo) 的非官方修改版本，不代表上游官方发布。请同时阅读 [NOTICE](NOTICE.md)、[第三方组件说明](THIRD_PARTY_NOTICES.md) 与随 App 一起分发的[完整第三方许可证目录](ThirdPartyLicenses/README.md)。
 
 - 允许：个人、学习、研究、教育、慈善、政府等**任何非商业目的**的使用、修改与分发。
 - 要求：修改或再分发时，必须保留版权声明（`Required Notice: Copyright (c) 2026 abcwyc`）与本许可证文本。

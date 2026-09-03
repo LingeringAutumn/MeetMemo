@@ -20,6 +20,18 @@ import Foundation
 enum SherpaRecognizerKind {
     case senseVoice
     case funASRNano
+    case qwen3ASR
+
+    var supportsSpeakerDiarization: Bool {
+        switch self {
+        case .senseVoice, .funASRNano:
+            return true
+        case .qwen3ASR:
+            // Post-recording interview tracks already have an authoritative role:
+            // mic = candidate, system = interviewer.
+            return false
+        }
+    }
 }
 
 /// Linearizes session lifecycle decisions before work is submitted to the recognizer queue.
@@ -153,7 +165,7 @@ final class SherpaSTTProvider: STTProvider, @unchecked Sendable {
     var capabilities: STTProviderCapabilities {
         STTProviderCapabilities(
             supportsStableUtteranceTiming: true,
-            supportsCorrections: true,
+            supportsCorrections: speakerDiarizationEnabled,
             supportsFinalizationFlush: true
         )
     }
@@ -192,8 +204,13 @@ final class SherpaSTTProvider: STTProvider, @unchecked Sendable {
     }
 
     private enum RuntimeConfiguration {
-        case senseVoice(modelDirectory: URL, modelFileName: String)
-        case funASRNano(modelDirectory: URL)
+        case senseVoice(
+            modelDirectory: URL,
+            modelFileName: String,
+            speakerDiarizationEnabled: Bool
+        )
+        case funASRNano(modelDirectory: URL, speakerDiarizationEnabled: Bool)
+        case qwen3ASR(modelDirectory: URL, hotwords: String)
     }
 
     private struct RefinementSnapshot {
@@ -210,11 +227,14 @@ final class SherpaSTTProvider: STTProvider, @unchecked Sendable {
     private var runtime: SherpaOnnxRuntime?
     private var sessionGeneration: UInt64?
     private var sessionCallbacks: SessionCallbacks?
+    private var speakerDiarizationEnabled = false
     private var ringBuffer: [Float] = []
     private var totalSamplesIngested: Int = 0
     private var emittedSegmentCount = 0
     private var lastEmittedEndSampleOffset = 0
+    private var lastProcessedEndSampleOffset = 0
     private var lastEmittedText = ""
+    private var transcriptSequenceGate = ASRTranscriptSequenceGate()
     private var speakerCentroids: [(centroid: [Float], count: Int)] = []
     private var segmentLedger: [SegmentRecord] = []
     private let workQueue = DispatchQueue(label: "io.meetmemo.sherpa.stt", qos: .userInitiated)
@@ -227,6 +247,8 @@ final class SherpaSTTProvider: STTProvider, @unchecked Sendable {
     private var vadSpeechSamples = 0
     private var emptyDecodeCount = 0
     private var fallbackDecodeCount = 0
+    private var qualityRejectedCount = 0
+    private var qualityRecoveryCount = 0
 
     private let kind: SherpaRecognizerKind
 
@@ -250,14 +272,16 @@ final class SherpaSTTProvider: STTProvider, @unchecked Sendable {
         }
     }
 
-    private func resolveRuntimeConfiguration() async throws -> RuntimeConfiguration {
+    private func resolveRuntimeConfiguration(config: STTProviderConfig) async throws -> RuntimeConfiguration {
+        let shouldDiarize = kind.supportsSpeakerDiarization && config.speakerMode == .diarized
         switch kind {
         case .senseVoice:
             return try await Task { @MainActor in
                 try await SherpaModelManager.shared.ensureReadyForUse()
                 return RuntimeConfiguration.senseVoice(
                     modelDirectory: SherpaModelManager.shared.modelDirectory,
-                    modelFileName: SherpaModelManager.shared.activeSenseVoiceModelFileName
+                    modelFileName: SherpaModelManager.shared.activeSenseVoiceModelFileName,
+                    speakerDiarizationEnabled: shouldDiarize
                 )
             }.value
         case .funASRNano:
@@ -265,7 +289,18 @@ final class SherpaSTTProvider: STTProvider, @unchecked Sendable {
                 guard SherpaModelManager.shared.modelFilesReady(SherpaModelManager.funASRNanoModelFiles) else {
                     throw FunASRNanoError.modelsNotReady
                 }
-                return .funASRNano(modelDirectory: SherpaModelManager.shared.modelDirectory)
+                return .funASRNano(
+                    modelDirectory: SherpaModelManager.shared.modelDirectory,
+                    speakerDiarizationEnabled: shouldDiarize
+                )
+            }.value
+        case .qwen3ASR:
+            return try await Task { @MainActor () throws -> RuntimeConfiguration in
+                try await Qwen3ASRModelManager.shared.ensureReadyForUse()
+                return .qwen3ASR(
+                    modelDirectory: SherpaModelManager.shared.modelDirectory,
+                    hotwords: config.hotwords
+                )
             }.value
         }
     }
@@ -285,13 +320,26 @@ final class SherpaSTTProvider: STTProvider, @unchecked Sendable {
                     do {
                         let runtime: SherpaOnnxRuntime
                         switch configuration {
-                        case .senseVoice(let modelDirectory, let modelFileName):
+                        case .senseVoice(
+                            let modelDirectory,
+                            let modelFileName,
+                            let speakerDiarizationEnabled
+                        ):
                             runtime = try SherpaOnnxRuntime.make(
                                 modelDirectory: modelDirectory,
-                                senseVoiceModelFileName: modelFileName
+                                senseVoiceModelFileName: modelFileName,
+                                enableSpeakerEmbedding: speakerDiarizationEnabled
                             )
-                        case .funASRNano(let modelDirectory):
-                            runtime = try SherpaOnnxRuntime.makeFunASRNano(modelDirectory: modelDirectory)
+                        case .funASRNano(let modelDirectory, let speakerDiarizationEnabled):
+                            runtime = try SherpaOnnxRuntime.makeFunASRNano(
+                                modelDirectory: modelDirectory,
+                                enableSpeakerEmbedding: speakerDiarizationEnabled
+                            )
+                        case .qwen3ASR(let modelDirectory, let hotwords):
+                            runtime = try SherpaOnnxRuntime.makeQwen3ASR(
+                                modelDirectory: modelDirectory,
+                                hotwords: hotwords
+                            )
                         }
                         continuation.resume(returning: runtime)
                     } catch {
@@ -308,6 +356,7 @@ final class SherpaSTTProvider: STTProvider, @unchecked Sendable {
     private func installRuntime(
         _ newRuntime: SherpaOnnxRuntime,
         callbacks: SessionCallbacks,
+        speakerDiarizationEnabled: Bool,
         generation: UInt64
     ) async -> Bool {
         await withCheckedContinuation { continuation in
@@ -317,6 +366,7 @@ final class SherpaSTTProvider: STTProvider, @unchecked Sendable {
                         runtime = newRuntime
                         sessionGeneration = generation
                         sessionCallbacks = callbacks
+                        self.speakerDiarizationEnabled = speakerDiarizationEnabled
                     }
                     continuation.resume(returning: activated)
                 }
@@ -328,7 +378,6 @@ final class SherpaSTTProvider: STTProvider, @unchecked Sendable {
     }
 
     func connect(config: STTProviderConfig) async throws {
-        _ = config
         let callbacks = callbackSnapshot()
         let generation = sessionGate.beginSession { [self] _ in
             workQueue.async { [self] in
@@ -337,7 +386,7 @@ final class SherpaSTTProvider: STTProvider, @unchecked Sendable {
         }
 
         do {
-            let runtimeConfiguration = try await resolveRuntimeConfiguration()
+            let runtimeConfiguration = try await resolveRuntimeConfiguration(config: config)
             try Task.checkCancellation()
             guard sessionGate.isCurrent(generation) else { throw CancellationError() }
 
@@ -353,6 +402,8 @@ final class SherpaSTTProvider: STTProvider, @unchecked Sendable {
             let installed = await installRuntime(
                 newRuntime,
                 callbacks: callbacks,
+                speakerDiarizationEnabled: config.speakerMode == .diarized
+                    && kind.supportsSpeakerDiarization,
                 generation: generation
             )
             guard installed, sessionGate.isCurrent(generation) else {
@@ -408,22 +459,38 @@ final class SherpaSTTProvider: STTProvider, @unchecked Sendable {
         }
     }
 
+    func awaitShutdown(timeout: TimeInterval) async -> STTFinalizationStatus {
+        await Self.waitForFinalization(timeout: timeout) { [self] completion in
+            // This marker does not use the session gate: `disconnect()` intentionally
+            // invalidates it before asynchronously releasing the runtime on workQueue.
+            workQueue.async {
+                completion()
+            }
+            return true
+        }
+    }
+
     private func resetSessionStateOnWorkQueue() {
         dispatchPrecondition(condition: .onQueue(workQueue))
         logDebugSummary()
         runtime = nil
         sessionGeneration = nil
         sessionCallbacks = nil
+        speakerDiarizationEnabled = false
         ringBuffer.removeAll(keepingCapacity: false)
         totalSamplesIngested = 0
         emittedSegmentCount = 0
         lastEmittedEndSampleOffset = 0
+        lastProcessedEndSampleOffset = 0
         lastEmittedText = ""
+        transcriptSequenceGate.reset()
         speakerCentroids.removeAll()
         segmentLedger.removeAll()
         vadSpeechSamples = 0
         emptyDecodeCount = 0
         fallbackDecodeCount = 0
+        qualityRejectedCount = 0
+        qualityRecoveryCount = 0
     }
 
     private func logDebugSummary() {
@@ -432,15 +499,38 @@ final class SherpaSTTProvider: STTProvider, @unchecked Sendable {
         let vadSeconds = Double(vadSpeechSamples) / Double(Self.sampleRate)
         let passedRatio = inputSeconds > 0 ? vadSeconds / inputSeconds : 0
         print(String(
-            format: "🔎 SenseVoice session: input %.1fs | VAD-passed %.1fs (%.0f%%) | segments %d | empty-decodes %d | fallback %d",
-            inputSeconds, vadSeconds, passedRatio * 100, emittedSegmentCount, emptyDecodeCount, fallbackDecodeCount
+            format: "🔎 Local ASR session: input %.1fs | VAD-passed %.1fs (%.0f%%) | segments %d | empty-decodes %d | tail-fallback %d | quality-rejected %d | quality-recovered %d",
+            inputSeconds,
+            vadSeconds,
+            passedRatio * 100,
+            emittedSegmentCount,
+            emptyDecodeCount,
+            fallbackDecodeCount,
+            qualityRejectedCount,
+            qualityRecoveryCount
         ))
     }
 
     func testConnection(config: STTProviderConfig, timeout: TimeInterval) async throws {
-        try await Task { @MainActor in
-            try await SherpaModelManager.shared.ensureReadyForUse()
-        }.value
+        _ = config
+        _ = timeout
+        switch kind {
+        case .senseVoice:
+            try await Task { @MainActor in
+                try await SherpaModelManager.shared.ensureReadyForUse()
+            }.value
+        case .funASRNano:
+            try await Task { @MainActor in
+                await FunASRNanoModelManager.shared.refreshReadiness()
+                guard FunASRNanoModelManager.shared.isReady else {
+                    throw FunASRNanoError.modelsNotReady
+                }
+            }.value
+        case .qwen3ASR:
+            try await Task { @MainActor in
+                try await Qwen3ASRModelManager.shared.ensureReadyForUse()
+            }.value
+        }
     }
 
     func awaitPendingFinalization(timeout: TimeInterval) async -> STTFinalizationStatus {
@@ -614,7 +704,7 @@ final class SherpaSTTProvider: STTProvider, @unchecked Sendable {
             historyStartOffset,
             totalSamplesIngested - Self.fallbackDecodeSampleLimit
         )
-        let fallbackStartOffset = max(boundedWindowStartOffset, lastEmittedEndSampleOffset)
+        let fallbackStartOffset = max(boundedWindowStartOffset, lastProcessedEndSampleOffset)
         let startIndex = fallbackStartOffset - historyStartOffset
         guard startIndex >= 0, startIndex < ringBuffer.count else { return nil }
 
@@ -629,10 +719,17 @@ final class SherpaSTTProvider: STTProvider, @unchecked Sendable {
         _ segment: SherpaOnnxRuntime.Segment,
         runtime: SherpaOnnxRuntime
     ) -> SherpaOnnxRuntime.Segment {
+        // Qwen decoding is substantially heavier than SenseVoice. Its normal VAD result
+        // has already been decoded once, so only retry with leading context when that first
+        // decode is empty instead of doubling inference work for every utterance.
+        if kind == .qwen3ASR,
+           !segment.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return segment
+        }
         let historyStartOffset = totalSamplesIngested - ringBuffer.count
         let contextStartOffset = max(
             historyStartOffset,
-            lastEmittedEndSampleOffset,
+            lastProcessedEndSampleOffset,
             segment.startSampleOffset - Self.leadingContextSamples
         )
         guard contextStartOffset < segment.startSampleOffset else {
@@ -661,25 +758,37 @@ final class SherpaSTTProvider: STTProvider, @unchecked Sendable {
         generation: UInt64
     ) {
         guard sessionGate.isCurrent(generation), sessionGeneration == generation else { return }
-        let text = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        lastProcessedEndSampleOffset = max(lastProcessedEndSampleOffset, segment.endSampleOffset)
+
+        guard let acceptedSegment = acceptedSegmentOrRecovery(for: segment, runtime: runtime) else {
+            return
+        }
+        let text = acceptedSegment.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else {
             emptyDecodeCount += 1
             return
         }
 
-        let embedding = runtime.embedding(for: segment.samples)
+        let embedding: [Float]
+        let speakerId: Int?
+        if speakerDiarizationEnabled {
+            embedding = runtime.embedding(for: acceptedSegment.samples)
+            speakerId = SpeakerClustering.assignOnline(
+                embedding: embedding,
+                centroids: &speakerCentroids
+            )
+        } else {
+            embedding = []
+            speakerId = nil
+        }
         guard sessionGate.isCurrent(generation), sessionGeneration == generation else { return }
 
         emittedSegmentCount += 1
-        lastEmittedEndSampleOffset = max(lastEmittedEndSampleOffset, segment.endSampleOffset)
+        lastEmittedEndSampleOffset = max(lastEmittedEndSampleOffset, acceptedSegment.endSampleOffset)
         lastEmittedText = text
-        let speakerId = SpeakerClustering.assignOnline(
-            embedding: embedding,
-            centroids: &speakerCentroids
-        )
 
-        let startMs = Int(Double(segment.startSampleOffset) * 1000.0 / Double(Self.sampleRate))
-        let endMs = Int(Double(segment.endSampleOffset) * 1000.0 / Double(Self.sampleRate))
+        let startMs = Int(Double(acceptedSegment.startSampleOffset) * 1000.0 / Double(Self.sampleRate))
+        let endMs = Int(Double(acceptedSegment.endSampleOffset) * 1000.0 / Double(Self.sampleRate))
         let tag = speakerId.map { Self.speakerTag(forId: $0) }
 
         // The embedding extractor can transiently return an empty vector while it
@@ -708,6 +817,65 @@ final class SherpaSTTProvider: STTProvider, @unchecked Sendable {
             guard let self, self.sessionGate.isCurrent(generation) else { return }
             callback?(update)
         }
+    }
+
+    private func acceptedSegmentOrRecovery(
+        for segment: SherpaOnnxRuntime.Segment,
+        runtime: SherpaOnnxRuntime
+    ) -> SherpaOnnxRuntime.Segment? {
+        let text = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let primaryEvaluation = ASRTranscriptQualityGate.evaluate(
+            text: text,
+            samples: segment.samples,
+            sampleRate: Self.sampleRate
+        )
+        let sequenceRejected = !text.isEmpty
+            && primaryEvaluation.isAcceptable
+            && transcriptSequenceGate.shouldReject(
+                text: text,
+                startSampleOffset: segment.startSampleOffset,
+                endSampleOffset: segment.endSampleOffset,
+                sampleRate: Self.sampleRate
+            )
+        if !text.isEmpty, primaryEvaluation.isAcceptable, !sequenceRejected {
+            return segment
+        }
+        qualityRejectedCount += 1
+
+        if let recovery = runtime.decodeRecoverySegment(
+            samples: segment.samples,
+            startSampleOffset: segment.startSampleOffset
+        ) {
+            let recoveryText = recovery.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let recoveryEvaluation = ASRTranscriptQualityGate.evaluate(
+                text: recoveryText,
+                samples: recovery.samples,
+                sampleRate: Self.sampleRate
+            )
+            let recoverySequenceRejected = !recoveryText.isEmpty
+                && recoveryEvaluation.isAcceptable
+                && transcriptSequenceGate.shouldReject(
+                    text: recoveryText,
+                    startSampleOffset: recovery.startSampleOffset,
+                    endSampleOffset: recovery.endSampleOffset,
+                    sampleRate: Self.sampleRate
+                )
+            if !recoveryText.isEmpty,
+               recoveryEvaluation.isAcceptable,
+               !recoverySequenceRejected {
+                qualityRecoveryCount += 1
+                return recovery
+            }
+        }
+
+        if debugLogging {
+            let reason = text.isEmpty
+                ? ASRTranscriptQualityGate.RejectionReason.emptySpeechDecode
+                : (sequenceRejected ? .repeatedPattern : primaryEvaluation.rejectionReason)
+            guard let reason else { return nil }
+            print("⚠️ Dropped implausible local ASR segment (\(reason.rawValue))")
+        }
+        return nil
     }
 
     private static func speakerTag(forId id: Int) -> String {

@@ -5,7 +5,12 @@ class SettingsViewModel: ObservableObject {
     @Published var settings = Settings()
     @Published var activeAlert: AlertMessage?
     @Published var isTestingLLM = false
+    @Published var isTestingAliyun = false
+    @Published var aliyunDashScopeAPIKey = ""
     @Published var templates: [NoteTemplate] = []
+    /// nil means the Keychain read failed, so an untouched empty UI field must not
+    /// delete a credential that may still exist.
+    private var loadedAliyunAPIKeySnapshot: String?
     
     init() {
         loadTemplates()
@@ -45,6 +50,18 @@ class SettingsViewModel: ObservableObject {
 
         settings.llmBaseURL = providerConfig.llmBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         settings.llmModel = providerConfig.llmModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        switch KeychainHelper.shared.loadAliyunDashScopeAPIKey() {
+        case .success(let key):
+            let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+            aliyunDashScopeAPIKey = trimmed
+            loadedAliyunAPIKeySnapshot = trimmed
+        case .notFound:
+            aliyunDashScopeAPIKey = ""
+            loadedAliyunAPIKeySnapshot = ""
+        case .authenticationFailed, .unavailable:
+            aliyunDashScopeAPIKey = ""
+            loadedAliyunAPIKeySnapshot = nil
+        }
     }
     
     func loadTemplates() {
@@ -69,7 +86,8 @@ class SettingsViewModel: ObservableObject {
         }
     }
     
-    func saveSettings(showMessage: Bool = true) {
+    @discardableResult
+    func saveSettings(showMessage: Bool = true) -> Bool {
         let lang = LanguageManager.shared
         // Validate that systemPrompt contains all required template placeholders
         let requiredKeys = ["meeting_title", "meeting_date", "transcript", "user_blurb", "template_content"]
@@ -90,14 +108,22 @@ class SettingsViewModel: ObservableObject {
                     )
                 )
             }
-            return
+            return false
         }
 
         settings.llmApiKey = settings.llmApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         settings.llmBaseURL = settings.llmBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         settings.llmModel = settings.llmModel.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        let allSaved = KeychainHelper.shared.saveProviderConfig(settings)
+        aliyunDashScopeAPIKey = aliyunDashScopeAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let providerSaved = KeychainHelper.shared.saveProviderConfig(settings)
+        let shouldWriteAliyunKey = loadedAliyunAPIKeySnapshot != nil || !aliyunDashScopeAPIKey.isEmpty
+        let aliyunKeySaved = !shouldWriteAliyunKey
+            || KeychainHelper.shared.saveAliyunDashScopeAPIKey(aliyunDashScopeAPIKey)
+        if aliyunKeySaved, shouldWriteAliyunKey {
+            loadedAliyunAPIKeySnapshot = aliyunDashScopeAPIKey
+        }
+        let allSaved = providerSaved && aliyunKeySaved
 
         if showMessage {
             if allSaved {
@@ -112,6 +138,7 @@ class SettingsViewModel: ObservableObject {
                 )
             }
         }
+        return allSaved
     }
 
     func testLLMConnection() {
@@ -168,6 +195,57 @@ class SettingsViewModel: ObservableObject {
 
             await MainActor.run {
                 self.isTestingLLM = false
+            }
+        }
+    }
+
+    func testAliyunConnection() {
+        let lang = LanguageManager.shared
+        let key = aliyunDashScopeAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else {
+            presentTestResult(
+                title: lang.t("阿里云测试失败", "Alibaba Cloud Test Failed"),
+                message: lang.t("请先填写 DashScope API Key。", "Enter a DashScope API Key first.")
+            )
+            return
+        }
+        guard !isTestingAliyun else { return }
+        isTestingAliyun = true
+
+        Task {
+            do {
+                _ = try await AliyunFileTranscriptionClient(configuration: .mainlandChina)
+                    .requestUploadPolicy(apiKey: key)
+                await MainActor.run {
+                    self.presentTestResult(
+                        title: lang.t("阿里云测试成功", "Alibaba Cloud Test Succeeded"),
+                        message: lang.t(
+                            "API Key 可以连接百炼；本次测试没有上传音频，也没有创建转写任务。",
+                            "The API Key connected to Model Studio. This test uploaded no audio and created no transcription task."
+                        )
+                    )
+                }
+            } catch {
+                let message: String
+                if let known = error as? AliyunFileTranscriptionError {
+                    message = AliyunCloudTranscriptionErrorSanitizer.description(for: known)
+                } else if let urlError = error as? URLError {
+                    message = lang.t(
+                        "网络请求失败（\(urlError.code.rawValue)）。",
+                        "Network request failed (\(urlError.code.rawValue))."
+                    )
+                } else {
+                    message = lang.t("无法连接阿里云百炼。", "Could not connect to Alibaba Cloud Model Studio.")
+                }
+                await MainActor.run {
+                    self.presentTestResult(
+                        title: lang.t("阿里云测试失败", "Alibaba Cloud Test Failed"),
+                        message: message
+                    )
+                }
+            }
+            await MainActor.run {
+                self.isTestingAliyun = false
             }
         }
     }

@@ -120,8 +120,18 @@ Temporary Items
 # API Keys and sensitive data
 *.plist.local
 APIKeys.swift
-.env
-.env.local
+.env*
+!.env.template
+*.p12
+*.pfx
+*.pem
+*.key
+*.p8
+*.pk8
+*.jks
+*.keystore
+*.mobileprovision
+*.provisionprofile
 
 releases/
 
@@ -133,3 +143,9 @@ Frameworks/
 
 # Playwright MCP debug artifacts
 .playwright-mcp/
+
+# Private cross-device delivery material (kept outside the public source snapshot)
+WINDOWS_GITHUB_HANDOFF.md
+WINDOWS_GITHUB_RELEASE_HANDOFF.md
+README-交付说明.md
+BUILD_VERIFICATION.md

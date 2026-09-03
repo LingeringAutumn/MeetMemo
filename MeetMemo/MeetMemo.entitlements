@@ -18,8 +18,8 @@
 	<true/>
 	<key>com.apple.security.temporary-exception.mach-lookup.global-name</key>
 	<array>
-		<string>com.youcai.meetmemo-spks</string>
-		<string>com.youcai.meetmemo-spki</string>
+		<string>io.github.lingeringautumn.meetmemo.interview-spks</string>
+		<string>io.github.lingeringautumn.meetmemo.interview-spki</string>
 	</array>
 </dict>
 </plist>

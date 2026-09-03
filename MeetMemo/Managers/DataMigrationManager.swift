@@ -27,6 +27,7 @@ class DataMigrationManager {
                 date: migratedMeeting.date,
                 title: migratedMeeting.title,
                 transcriptChunks: migratedMeeting.transcriptChunks,
+                transcriptionProvenanceVersion: migratedMeeting.transcriptionProvenanceVersion,
                 userNotes: migratedMeeting.userNotes,
                 generatedNotes: migratedMeeting.generatedNotes,
                 templateId: migratedMeeting.templateId,

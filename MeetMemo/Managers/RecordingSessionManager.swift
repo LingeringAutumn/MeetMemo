@@ -29,6 +29,11 @@ class RecordingSessionManager: ObservableObject {
     @Published var warningMessage: String?
     @Published var activeRecordingTranscriptChunksUpdated: [TranscriptChunk] = []
     @Published var activeRecordingStartedAt: Date?
+    /// Startup recovery finalizes any interrupted raw tracks before a new session
+    /// may choose its timeline base. This prevents recovered and new ranges from
+    /// overlapping when the user clicks Record immediately after launch.
+    @Published private(set) var isRecoveringRecordings = true
+    @Published private(set) var latestRecordingArtifact: RecordingArtifact?
     
     private let audioManager = AudioManager.shared
     private var cancellables = Set<AnyCancellable>()
@@ -43,6 +48,8 @@ class RecordingSessionManager: ObservableObject {
     private init() {
         setupAudioManagerBindings()
         setupDebouncedSaving()
+        _ = AliyunPostRecordingTranscriptionService.shared
+        recoverInterruptedRecordings()
     }
     
     private func setupAudioManagerBindings() {
@@ -115,6 +122,13 @@ class RecordingSessionManager: ObservableObject {
                 self?.warningMessage = warningMessage
             }
             .store(in: &cancellables)
+
+        audioManager.$latestRecordingArtifact
+            .compactMap { $0 }
+            .sink { [weak self] artifact in
+                self?.latestRecordingArtifact = artifact
+            }
+            .store(in: &cancellables)
         
         // When transcript chunks change, store them for the active recording and send to debouncer
         audioManager.$transcriptChunks
@@ -154,6 +168,13 @@ class RecordingSessionManager: ObservableObject {
     }
     
     func startRecording(for meetingId: UUID, existingChunks: [TranscriptChunk] = []) {
+        guard !isRecoveringRecordings else {
+            warningMessage = LanguageManager.shared.t(
+                "正在检查并恢复上次中断的录音，请稍等片刻后再开始。",
+                "Checking and recovering an interrupted recording. Please wait a moment before starting."
+            )
+            return
+        }
         guard activeMeetingId == nil,
               !isRecording,
               !isStoppingRecording else {
@@ -168,9 +189,19 @@ class RecordingSessionManager: ObservableObject {
         VoiceInputManager.shared.cancelForRecording()
         print("🎙️ Starting recording for meeting: \(meetingId)")
 
-        let resumableChunks = existingChunks
-            .filter(\.isFinal)
-            .sortedByTranscriptTimeline()
+        // The detail view can initially hold only a lightweight summary. Reload the
+        // canonical meeting synchronously before reserving a timeline. When it exists,
+        // the disk snapshot is authoritative as a whole: merging arbitrary missing IDs
+        // from a stale detail view could resurrect local chunks already replaced by an
+        // accurate post-recording transcript.
+        let persistedMeeting = LocalStorageManager.shared.loadMeeting(id: meetingId)
+        let resumableChunks = Self.resumableTranscriptChunks(
+            inMemory: existingChunks,
+            persistedMeeting: persistedMeeting
+        )
+        let persistedTimelineEnd = AudioManager.maximumPersistedMeetingTimelineEnd(
+            in: persistedMeeting
+        )
         activeRecordingTranscriptChunks = resumableChunks
         audioManager.transcriptChunks = resumableChunks
 
@@ -178,7 +209,10 @@ class RecordingSessionManager: ObservableObject {
         activeSessionToken = UUID()
         activeRecordingStartedAt = Date()
         hasObservedAudioRecordingStart = false
-        audioManager.startRecording()
+        audioManager.startRecording(
+            meetingID: meetingId,
+            persistedMeetingTimelineEndMilliseconds: persistedTimelineEnd
+        )
     }
     
     func stopRecording() {
@@ -215,6 +249,11 @@ class RecordingSessionManager: ObservableObject {
         return isRecording && activeMeetingId == meetingId
     }
 
+    func activeSTTEngine(for meetingId: UUID) -> STTEngine? {
+        guard isRecordingMeeting(meetingId) else { return nil }
+        return audioManager.activeRecordingSTTEngine
+    }
+
     func hasActiveSession(for meetingId: UUID) -> Bool {
         activeMeetingId == meetingId
     }
@@ -236,6 +275,15 @@ class RecordingSessionManager: ObservableObject {
     func getActiveRecordingTranscriptChunks() -> [TranscriptChunk] {
         return activeRecordingTranscriptChunks
     }
+
+    nonisolated static func resumableTranscriptChunks(
+        inMemory: [TranscriptChunk],
+        persistedMeeting: Meeting?
+    ) -> [TranscriptChunk] {
+        (persistedMeeting?.transcriptChunks ?? inMemory)
+            .filter(\.isFinal)
+            .sortedByTranscriptTimeline()
+    }
     
     /// Get transcript chunks for a specific meeting, ensuring proper data separation
     func getTranscriptChunks(for meetingId: UUID) -> [TranscriptChunk] {
@@ -250,4 +298,27 @@ class RecordingSessionManager: ObservableObject {
             return []
         }
     }
-} 
+
+    func latestRecordingArtifact(for meetingID: UUID) -> RecordingArtifact? {
+        if latestRecordingArtifact?.meetingID == meetingID {
+            return latestRecordingArtifact
+        }
+        return LocalStorageManager.shared.latestRecordingArtifact(for: meetingID)
+    }
+
+    private func recoverInterruptedRecordings() {
+        Task.detached(priority: .utility) {
+            let artifacts = MeetingRecordingStore.shared.recoverIncompleteRecordings()
+            await MainActor.run { [weak self] in
+                self?.isRecoveringRecordings = false
+                for artifact in artifacts {
+                    self?.latestRecordingArtifact = artifact
+                    NotificationCenter.default.post(
+                        name: .meetingRecordingArtifactRecovered,
+                        object: artifact
+                    )
+                }
+            }
+        }
+    }
+}

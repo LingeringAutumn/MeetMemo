@@ -35,7 +35,7 @@ final class MeetingTranscriptFormattingTests: XCTestCase {
             """
             mic · 发言人 A · 00:00 - 00:02: 第一句
             第二句
-            online · 发言人 B · 00:03 - 00:04: 对方回复
+            system · 发言人 B · 00:03 - 00:04: 对方回复
             """
         )
 

@@ -5,8 +5,8 @@ import AVFoundation
 
 enum TapTarget {
     case singleProcess(AudioProcess)
-    /// Legacy associated values are retained so existing call sites keep compiling.  System
-    /// capture itself is global and deliberately ignores this snapshot; see `tapMixPolicy`.
+    /// Explicit Core Audio process allowlist for supported meeting clients. An empty list is
+    /// invalid and must never be interpreted as permission to capture global system audio.
     case systemAudio(processObjectIDs: [AudioObjectID])
 
     var displayName: String {
@@ -14,7 +14,7 @@ enum TapTarget {
         case .singleProcess(let process):
             return process.name
         case .systemAudio:
-            return "System Audio Output"
+            return "Meeting Audio Output"
         }
     }
 
@@ -57,7 +57,17 @@ final class ProcessTap {
 
     enum TapMixPolicy: Equatable {
         case includeProcesses([AudioObjectID])
-        case globalExcludingProcesses([AudioObjectID])
+    }
+
+    enum ConfigurationError: LocalizedError, Equatable {
+        case noSupportedMeetingAudioProcess
+
+        var errorDescription: String? {
+            switch self {
+            case .noSupportedMeetingAudioProcess:
+                return "未检测到腾讯会议、WeMeet、VooV 或飞书/Lark 的音频进程；为保护隐私，不会录制全系统音频。"
+            }
+        }
     }
 
     let target: TapTarget
@@ -69,7 +79,10 @@ final class ProcessTap {
     init(target: TapTarget, muteWhenRunning: Bool = false) {
         self.target = target
         self.muteWhenRunning = muteWhenRunning
-        self.logger = Logger(subsystem: "com.youcai.meetmemo", category: "\(String(describing: ProcessTap.self))(\(target.loggingProcessName))")
+        self.logger = Logger(
+            subsystem: Bundle.main.bundleIdentifier ?? "io.github.lingeringautumn.meetmemo.interview",
+            category: "\(String(describing: ProcessTap.self))(\(target.loggingProcessName))"
+        )
     }
 
     @ObservationIgnored
@@ -82,6 +95,16 @@ final class ProcessTap {
     private(set) var tapStreamDescription: AudioStreamBasicDescription?
     @ObservationIgnored
     private var invalidationHandler: InvalidationHandler?
+    @ObservationIgnored
+    private let invalidationLock = NSLock()
+    @ObservationIgnored
+    private let watchdogLock = NSLock()
+    @ObservationIgnored
+    private let watchdogQueue = DispatchQueue(label: "io.meetmemo.process-tap.watchdog", qos: .utility)
+    @ObservationIgnored
+    private var watchdogTimer: DispatchSourceTimer?
+    @ObservationIgnored
+    private var lastIOCallbackUptimeNanoseconds: UInt64 = 0
 
     @ObservationIgnored
     private(set) var activated = false
@@ -109,13 +132,18 @@ final class ProcessTap {
     /// Tears down the tap.  Owner-requested teardown must not masquerade as an unexpected
     /// Core Audio failure: doing so used to make normal stop/degrade paths schedule a restart.
     func invalidate(reason: InvalidationReason = .requested) {
-        guard activated else { return }
+        invalidationLock.lock()
+        guard activated else {
+            invalidationLock.unlock()
+            return
+        }
         activated = false
-
-        logger.debug(#function)
-
         let handler = invalidationHandler
         self.invalidationHandler = nil
+        invalidationLock.unlock()
+        stopWatchdog()
+
+        logger.debug(#function)
 
         if aggregateDeviceID.isValid {
             var err: OSStatus
@@ -156,18 +184,12 @@ final class ProcessTap {
     private func prepare() throws {
         errorMessage = nil
 
-        let policy = Self.tapMixPolicy(
-            for: target,
-            currentProcessObjectID: AudioProcessController.currentProcessAudioObjectID
-        )
+        let policy = try Self.tapMixPolicy(for: target)
         let tapDescription: CATapDescription
         switch policy {
         case .includeProcesses(let processObjectIDs):
             tapDescription = CATapDescription(stereoMixdownOfProcesses: processObjectIDs)
             logger.debug("Configuring tap for \(processObjectIDs.count) explicit process(es).")
-        case .globalExcludingProcesses(let processObjectIDs):
-            tapDescription = CATapDescription(stereoGlobalTapButExcludeProcesses: processObjectIDs)
-            logger.debug("Configuring global system audio tap excluding \(processObjectIDs.count) process(es).")
         }
         
         tapDescription.uuid = UUID()
@@ -295,28 +317,122 @@ final class ProcessTap {
         logger.debug("Run tap!")
         self.invalidationHandler = invalidationHandler
 
-        var err = AudioDeviceCreateIOProcIDWithBlock(&deviceProcID, aggregateDeviceID, queue, ioBlock)
+        let monitoredIOBlock: AudioDeviceIOBlock = { [weak self] inNow, inInputData, inInputTime, outOutputData, inOutputTime in
+            self?.recordIOCallback()
+            ioBlock(inNow, inInputData, inInputTime, outOutputData, inOutputTime)
+        }
+
+        var err = AudioDeviceCreateIOProcIDWithBlock(
+            &deviceProcID,
+            aggregateDeviceID,
+            queue,
+            monitoredIOBlock
+        )
         guard err == noErr else { throw "Failed to create device I/O proc: \(err)" }
 
         err = AudioDeviceStart(aggregateDeviceID, deviceProcID)
         guard err == noErr else { throw "Failed to start audio device: \(err)" }
+        startWatchdog()
     }
 
     deinit { invalidate() }
 
-    /// Pure policy used by `prepare()` and unit tests.  The legacy system-audio process list is
-    /// intentionally ignored: a global tap automatically follows applications that begin or
-    /// stop producing audio after recording starts.
-    static func tapMixPolicy(
-        for target: TapTarget,
-        currentProcessObjectID: AudioObjectID?
-    ) -> TapMixPolicy {
+    /// Pure policy used by `prepare()` and unit tests. Every tap uses an explicit process
+    /// allowlist. In particular, an empty system-audio list is rejected so it can never become
+    /// a global tap through Core Audio API semantics or a future refactor.
+    static func tapMixPolicy(for target: TapTarget) throws -> TapMixPolicy {
         switch target {
         case .singleProcess(let process):
+            guard process.objectID.isValid else {
+                throw ConfigurationError.noSupportedMeetingAudioProcess
+            }
             return .includeProcesses([process.objectID])
-        case .systemAudio:
-            let exclusions = currentProcessObjectID.flatMap { $0.isValid ? [$0] : nil } ?? []
-            return .globalExcludingProcesses(exclusions)
+        case .systemAudio(let processObjectIDs):
+            let validIDs = Array(Set(processObjectIDs.filter(\.isValid))).sorted()
+            guard !validIDs.isEmpty else {
+                throw ConfigurationError.noSupportedMeetingAudioProcess
+            }
+            return .includeProcesses(validIDs)
+        }
+    }
+
+    nonisolated static func watchdogShouldInvalidate(
+        nowUptimeNanoseconds: UInt64,
+        lastCallbackUptimeNanoseconds: UInt64,
+        timeoutNanoseconds: UInt64,
+        hasAnyTargetProcess: Bool
+    ) -> Bool {
+        guard hasAnyTargetProcess else { return true }
+        guard nowUptimeNanoseconds >= lastCallbackUptimeNanoseconds else { return false }
+        return nowUptimeNanoseconds - lastCallbackUptimeNanoseconds > timeoutNanoseconds
+    }
+
+    private func recordIOCallback() {
+        watchdogLock.lock()
+        if watchdogTimer != nil {
+            lastIOCallbackUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
+        }
+        watchdogLock.unlock()
+    }
+
+    private func startWatchdog() {
+        let timer = DispatchSource.makeTimerSource(queue: watchdogQueue)
+        watchdogLock.lock()
+        watchdogTimer?.cancel()
+        watchdogTimer = timer
+        lastIOCallbackUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
+        watchdogLock.unlock()
+
+        timer.schedule(
+            deadline: .now() + .seconds(8),
+            repeating: .seconds(2),
+            leeway: .milliseconds(500)
+        )
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            self.watchdogLock.lock()
+            let isCurrentTimer = self.watchdogTimer === timer
+            let lastCallback = self.lastIOCallbackUptimeNanoseconds
+            self.watchdogLock.unlock()
+            guard isCurrentTimer else { return }
+
+            let hasTargetProcess: Bool
+            do {
+                let current = Set(try AudioObjectID.readProcessList())
+                hasTargetProcess = !current.isDisjoint(with: Set(self.targetProcessObjectIDs))
+            } catch {
+                // A transient process-list read failure is not proof that capture died;
+                // the callback heartbeat still provides an independent failure signal.
+                hasTargetProcess = true
+            }
+            let shouldInvalidate = Self.watchdogShouldInvalidate(
+                nowUptimeNanoseconds: DispatchTime.now().uptimeNanoseconds,
+                lastCallbackUptimeNanoseconds: lastCallback,
+                timeoutNanoseconds: 5_000_000_000,
+                hasAnyTargetProcess: hasTargetProcess
+            )
+            if shouldInvalidate {
+                self.invalidate(reason: .unexpected)
+            }
+        }
+        timer.resume()
+    }
+
+    private func stopWatchdog() {
+        watchdogLock.lock()
+        let timer = watchdogTimer
+        watchdogTimer = nil
+        watchdogLock.unlock()
+        timer?.setEventHandler {}
+        timer?.cancel()
+    }
+
+    private var targetProcessObjectIDs: [AudioObjectID] {
+        switch target {
+        case .singleProcess(let process):
+            return process.objectID.isValid ? [process.objectID] : []
+        case .systemAudio(let processObjectIDs):
+            return processObjectIDs.filter(\.isValid)
         }
     }
 
@@ -374,7 +490,10 @@ final class ProcessTapRecorder {
         self.tapDisplayName = tap.displayName
         self.fileURL = fileURL
         self._tap = tap
-        self.logger = Logger(subsystem: "com.youcai.meetmemo", category: "\(String(describing: ProcessTapRecorder.self))(\(fileURL.lastPathComponent))")
+        self.logger = Logger(
+            subsystem: Bundle.main.bundleIdentifier ?? "io.github.lingeringautumn.meetmemo.interview",
+            category: "\(String(describing: ProcessTapRecorder.self))(\(fileURL.lastPathComponent))"
+        )
         
         self.icon = tap.target.iconImage
     }

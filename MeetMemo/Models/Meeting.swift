@@ -10,7 +10,7 @@ enum AudioSource: String, Codable, CaseIterable {
         case .mic:
             return "mic"
         case .system:
-            return "online"
+            return "system"
         }
     }
     
@@ -19,7 +19,7 @@ enum AudioSource: String, Codable, CaseIterable {
         case .mic:
             return "mic"
         case .system:
-            return "online"
+            return "system"
         }
     }
     
@@ -30,6 +30,50 @@ enum AudioSource: String, Codable, CaseIterable {
         case .system:
             return "speaker.wave.2.fill"
         }
+    }
+}
+
+/// The engine that produced an authoritative post-recording transcript range.
+/// This is deliberately separate from `AudioSource`: `mic` / `system` describe
+/// audio tracks, while this value records which recognizer produced the text.
+enum AccurateTranscriptionEngine: String, Codable, Hashable, Sendable {
+    case aliyunCloud = "aliyun-cloud"
+    case localQwen3 = "local-qwen3"
+}
+
+/// Durable provenance for one finalized recording session. A meeting can contain
+/// several receipts after continuation recordings, and each replaced range may
+/// still retain local live chunks in gaps rejected by the quality gate.
+struct AccurateTranscriptReceipt: Codable, Identifiable, Hashable, Sendable {
+    let artifactID: UUID
+    let recordingSessionID: UUID
+    let engine: AccurateTranscriptionEngine
+    let modelName: String
+    let replacementStartMilliseconds: Int
+    let replacementEndMilliseconds: Int
+    let completedAt: Date
+
+    var id: UUID { artifactID }
+
+    init(
+        artifactID: UUID,
+        recordingSessionID: UUID,
+        engine: AccurateTranscriptionEngine,
+        modelName: String,
+        replacementStartMilliseconds: Int,
+        replacementEndMilliseconds: Int,
+        completedAt: Date = Date()
+    ) {
+        self.artifactID = artifactID
+        self.recordingSessionID = recordingSessionID
+        self.engine = engine
+        self.modelName = modelName
+        self.replacementStartMilliseconds = max(0, replacementStartMilliseconds)
+        self.replacementEndMilliseconds = max(
+            self.replacementStartMilliseconds,
+            replacementEndMilliseconds
+        )
+        self.completedAt = completedAt
     }
 }
 
@@ -673,6 +717,16 @@ struct Meeting: Codable, Identifiable, Hashable {
     let date: Date
     var title: String
     var transcriptChunks: [TranscriptChunk]
+    /// Monotonically increases whenever a post-recording engine authoritatively
+    /// replaces transcript ranges. It is a write fence against stale UI/AI snapshots.
+    var transcriptRevision: Int
+    /// Per-recording receipts for post-recording transcript replacements. Older
+    /// meeting files decode this as an empty array and are shown as source unknown.
+    var accurateTranscriptReceipts: [AccurateTranscriptReceipt]
+    /// Schema marker for transcript-source provenance. A value of zero means the
+    /// meeting predates provenance metadata, so an empty receipt list cannot prove
+    /// that the visible text came only from the local live recognizer.
+    var transcriptionProvenanceVersion: Int
     /// Legacy single text field retained for backward compatibility with older meeting files.
     var userNotes: String
     var contextItems: [MeetingContextItem]
@@ -701,6 +755,9 @@ struct Meeting: Codable, Identifiable, Hashable {
          date: Date = Date(),
          title: String = "",
          transcriptChunks: [TranscriptChunk] = [],
+         transcriptRevision: Int = 0,
+         accurateTranscriptReceipts: [AccurateTranscriptReceipt] = [],
+         transcriptionProvenanceVersion: Int = 1,
          userNotes: String = "",
          contextItems: [MeetingContextItem] = [],
          generatedNotes: String = "",
@@ -723,6 +780,11 @@ struct Meeting: Codable, Identifiable, Hashable {
         self.date = date
         self.title = title
         self.transcriptChunks = transcriptChunks
+        self.transcriptRevision = max(0, transcriptRevision)
+        self.accurateTranscriptReceipts = Self.normalizedAccurateTranscriptReceipts(
+            accurateTranscriptReceipts
+        )
+        self.transcriptionProvenanceVersion = max(0, transcriptionProvenanceVersion)
         self.userNotes = userNotes
         self.contextItems = Self.normalizedContextItems(contextItems, legacyUserNotes: userNotes, date: date)
         self.generatedNotes = generatedNotes
@@ -748,6 +810,9 @@ struct Meeting: Codable, Identifiable, Hashable {
         case date
         case title
         case transcriptChunks
+        case transcriptRevision
+        case accurateTranscriptReceipts
+        case transcriptionProvenanceVersion
         case userNotes
         case contextItems
         case generatedNotes
@@ -774,6 +839,20 @@ struct Meeting: Codable, Identifiable, Hashable {
         date = try container.decodeIfPresent(Date.self, forKey: .date) ?? Date()
         title = try container.decodeIfPresent(String.self, forKey: .title) ?? ""
         transcriptChunks = try container.decodeIfPresent([TranscriptChunk].self, forKey: .transcriptChunks) ?? []
+        transcriptRevision = max(0, try container.decodeIfPresent(Int.self, forKey: .transcriptRevision) ?? 0)
+        accurateTranscriptReceipts = Self.normalizedAccurateTranscriptReceipts(
+            try container.decodeIfPresent(
+                [AccurateTranscriptReceipt].self,
+                forKey: .accurateTranscriptReceipts
+            ) ?? []
+        )
+        transcriptionProvenanceVersion = max(
+            0,
+            try container.decodeIfPresent(
+                Int.self,
+                forKey: .transcriptionProvenanceVersion
+            ) ?? (container.contains(.accurateTranscriptReceipts) ? 1 : 0)
+        )
         userNotes = try container.decodeIfPresent(String.self, forKey: .userNotes) ?? ""
         let decodedContextItems = try container.decodeIfPresent([MeetingContextItem].self, forKey: .contextItems) ?? []
         contextItems = Self.normalizedContextItems(decodedContextItems, legacyUserNotes: userNotes, date: date)
@@ -797,6 +876,126 @@ struct Meeting: Codable, Identifiable, Hashable {
         structuredSummarySourceHash = try container.decodeIfPresent(String.self, forKey: .structuredSummarySourceHash) ?? ""
         structuredSummaryGeneratedAt = try container.decodeIfPresent(Date.self, forKey: .structuredSummaryGeneratedAt)
         dataVersion = try container.decodeIfPresent(Int.self, forKey: .dataVersion) ?? 1
+    }
+
+    /// Combines an ordinary save snapshot with the current disk state. A lower
+    /// transcript revision may update non-transcript fields, but can never revive
+    /// superseded live chunks or speaker-role metadata.
+    func mergingForPersistence(
+        with existing: Meeting,
+        preserveMissingFinalChunks: Bool
+    ) -> Meeting {
+        guard id == existing.id, preserveMissingFinalChunks else { return self }
+
+        var merged = self
+        if transcriptRevision < existing.transcriptRevision {
+            merged.transcriptChunks = existing.transcriptChunks
+            merged.transcriptRevision = existing.transcriptRevision
+            merged.accurateTranscriptReceipts = existing.accurateTranscriptReceipts
+            merged.transcriptionProvenanceVersion = max(
+                transcriptionProvenanceVersion,
+                existing.transcriptionProvenanceVersion
+            )
+            merged.speakerNameMappings = existing.speakerNameMappings
+            return merged
+        }
+
+        if transcriptRevision > existing.transcriptRevision {
+            merged.accurateTranscriptReceipts = Self.mergingAccurateTranscriptReceipts(
+                existing.accurateTranscriptReceipts,
+                accurateTranscriptReceipts
+            )
+            merged.transcriptionProvenanceVersion = max(
+                transcriptionProvenanceVersion,
+                existing.transcriptionProvenanceVersion
+            )
+            return merged
+        }
+
+        merged.transcriptChunks = transcriptChunks
+            .mergingTranscriptCorrections(preservingMissingFinalChunksFrom: existing.transcriptChunks)
+        merged.accurateTranscriptReceipts = Self.mergingAccurateTranscriptReceipts(
+            existing.accurateTranscriptReceipts,
+            accurateTranscriptReceipts
+        )
+        merged.transcriptionProvenanceVersion = max(
+            transcriptionProvenanceVersion,
+            existing.transcriptionProvenanceVersion
+        )
+        var mappings = existing.speakerNameMappings
+        mappings.merge(speakerNameMappings) { _, incomingName in incomingName }
+        merged.speakerNameMappings = mappings
+        return merged
+    }
+
+    /// Replaces only transcript-owned state with an equal-or-newer authoritative
+    /// snapshot, keeping every unrelated field from the currently open meeting.
+    func adoptingAuthoritativeTranscript(from authoritative: Meeting) -> Meeting? {
+        guard id == authoritative.id,
+              authoritative.transcriptRevision >= transcriptRevision else {
+            return nil
+        }
+
+        var merged = self
+        merged.transcriptChunks = authoritative.transcriptChunks
+        merged.transcriptRevision = authoritative.transcriptRevision
+        merged.accurateTranscriptReceipts = Self.mergingAccurateTranscriptReceipts(
+            accurateTranscriptReceipts,
+            authoritative.accurateTranscriptReceipts
+        )
+        merged.transcriptionProvenanceVersion = max(
+            transcriptionProvenanceVersion,
+            authoritative.transcriptionProvenanceVersion
+        )
+        var mappings = authoritative.speakerNameMappings
+        mappings.merge(speakerNameMappings) { _, localName in localName }
+        merged.speakerNameMappings = mappings
+        merged.dataVersion = max(dataVersion, authoritative.dataVersion)
+        return merged
+    }
+
+    /// The receipt for the latest recording range, not merely the job that happened
+    /// to finish last. This keeps continuation-session status stable when jobs finish
+    /// out of order.
+    var latestAccurateTranscriptReceipt: AccurateTranscriptReceipt? {
+        accurateTranscriptReceipts.max { lhs, rhs in
+            if lhs.replacementStartMilliseconds != rhs.replacementStartMilliseconds {
+                return lhs.replacementStartMilliseconds < rhs.replacementStartMilliseconds
+            }
+            return lhs.completedAt < rhs.completedAt
+        }
+    }
+
+    private static func normalizedAccurateTranscriptReceipts(
+        _ receipts: [AccurateTranscriptReceipt]
+    ) -> [AccurateTranscriptReceipt] {
+        mergingAccurateTranscriptReceipts([], receipts)
+    }
+
+    private static func mergingAccurateTranscriptReceipts(
+        _ existing: [AccurateTranscriptReceipt],
+        _ incoming: [AccurateTranscriptReceipt]
+    ) -> [AccurateTranscriptReceipt] {
+        var byArtifact: [UUID: AccurateTranscriptReceipt] = [:]
+        for receipt in existing + incoming {
+            guard receipt.replacementEndMilliseconds > receipt.replacementStartMilliseconds else {
+                continue
+            }
+            if let current = byArtifact[receipt.artifactID], current.completedAt > receipt.completedAt {
+                continue
+            }
+            byArtifact[receipt.artifactID] = receipt
+        }
+
+        // Receipts are the durable completion journal for recording manifests. Do
+        // not truncate them while the corresponding audio artifacts are retained,
+        // otherwise an old completed artifact would eventually look pending again.
+        return byArtifact.values.sorted { lhs, rhs in
+            if lhs.replacementStartMilliseconds != rhs.replacementStartMilliseconds {
+                return lhs.replacementStartMilliseconds < rhs.replacementStartMilliseconds
+            }
+            return lhs.completedAt < rhs.completedAt
+        }
     }
 
     var structuredSummaryCurrentSourceHash: String {
@@ -1040,8 +1239,14 @@ struct Meeting: Codable, Identifiable, Hashable {
 
         for chunk in transcriptChunks.sortedByTranscriptTimeline() {
             guard let key = chunk.speakerIdentityKey, result[key] == nil else { continue }
-            result[key] = Self.speakerLabel(for: nextSpeakerIndex)
-            nextSpeakerIndex += 1
+            if chunk.speakerTag == "candidate" {
+                result[key] = "候选人"
+            } else if chunk.speakerTag == "interviewer" {
+                result[key] = "面试官"
+            } else {
+                result[key] = Self.speakerLabel(for: nextSpeakerIndex)
+                nextSpeakerIndex += 1
+            }
         }
 
         return result

@@ -3,11 +3,11 @@
 <plist version="1.0">
 <dict>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>MeetMemo needs access to your microphone to record meeting audio for transcription.</string>
+	<string>MeetMemo records microphone audio for meeting transcription. Audio stays on this Mac unless you enable optional cloud-accurate transcription.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
-	<string>MeetMemo uses on-device speech recognition to transcribe meeting audio. Audio never leaves your device.</string>
+	<string>MeetMemo uses on-device speech recognition for live transcription. Audio stays on this Mac unless you enable optional cloud-accurate transcription.</string>
 	<key>NSAudioCaptureUsageDescription</key>
-	<string>This app needs access to capture system audio for transcription.</string>
+	<string>MeetMemo captures system audio for meeting transcription. Audio stays on this Mac unless you enable optional cloud-accurate transcription.</string>
 	<key>NSRemindersFullAccessUsageDescription</key>
 	<string>MeetMemo needs access to Reminders so you can add confirmed meeting tasks to the Reminders app.</string>
 	<key>NSRemindersUsageDescription</key>

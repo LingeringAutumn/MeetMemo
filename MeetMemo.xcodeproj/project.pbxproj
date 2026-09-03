@@ -306,7 +306,7 @@
 				MACOSX_DEPLOYMENT_TARGET = 15.5;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
-				ONLY_ACTIVE_ARCH = YES;
+				ONLY_ACTIVE_ARCH = NO;
 				SDKROOT = macosx;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
@@ -381,14 +381,13 @@
 				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 29;
+				CURRENT_PROJECT_VERSION = 30;
 				DEVELOPMENT_ASSET_PATHS = "\"MeetMemo/Preview Content\"";
-				DEVELOPMENT_TEAM = 423SMX6Z4A;
 				ENABLE_PREVIEWS = YES;
 				FRAMEWORK_SEARCH_PATHS = "$(PROJECT_DIR)/Frameworks";
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = MeetMemo/Info.plist;
-				INFOPLIST_KEY_CFBundleDisplayName = MeetMemo;
+				INFOPLIST_KEY_CFBundleDisplayName = "MeetMemo Interview";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "This app needs access to your microphone for transcription.";
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -396,7 +395,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.5;
-				MARKETING_VERSION = 0.59;
+				MARKETING_VERSION = 0.59.2;
 				ONLY_ACTIVE_ARCH = NO;
 				OTHER_LDFLAGS = (
 					"$(inherited)",
@@ -405,8 +404,8 @@
 					"-lonnxruntime",
 				);
 				OTHER_SWIFT_FLAGS = "$(inherited) -D ENABLE_TCC_SPI";
-				PRODUCT_BUNDLE_IDENTIFIER = com.youcai.meetmemo;
-				PRODUCT_NAME = MeetMemo;
+				PRODUCT_BUNDLE_IDENTIFIER = io.github.lingeringautumn.meetmemo.interview;
+				PRODUCT_NAME = "MeetMemo Interview";
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG SHERPA_ONNX_ENABLED $(inherited)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
@@ -428,15 +427,14 @@
 				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 29;
+				CURRENT_PROJECT_VERSION = 30;
 				DEVELOPMENT_ASSET_PATHS = "\"MeetMemo/Preview Content\"";
-				DEVELOPMENT_TEAM = 423SMX6Z4A;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
 				FRAMEWORK_SEARCH_PATHS = "$(PROJECT_DIR)/Frameworks";
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = MeetMemo/Info.plist;
-				INFOPLIST_KEY_CFBundleDisplayName = MeetMemo;
+				INFOPLIST_KEY_CFBundleDisplayName = "MeetMemo Interview";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "This app needs access to your microphone for transcription.";
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -444,8 +442,8 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.5;
-				MARKETING_VERSION = 0.59;
-				ONLY_ACTIVE_ARCH = YES;
+				MARKETING_VERSION = 0.59.2;
+				ONLY_ACTIVE_ARCH = NO;
 				OTHER_LDFLAGS = (
 					"$(inherited)",
 					"-L$(PROJECT_DIR)/Frameworks/onnxruntime/lib",
@@ -453,8 +451,8 @@
 					"-lonnxruntime",
 				);
 				OTHER_SWIFT_FLAGS = "$(inherited) -D ENABLE_TCC_SPI";
-				PRODUCT_BUNDLE_IDENTIFIER = com.youcai.meetmemo;
-				PRODUCT_NAME = MeetMemo;
+				PRODUCT_BUNDLE_IDENTIFIER = io.github.lingeringautumn.meetmemo.interview;
+				PRODUCT_NAME = "MeetMemo Interview";
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "SHERPA_ONNX_ENABLED $(inherited)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
@@ -473,10 +471,10 @@
 				CODE_SIGN_STYLE = Manual;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 15.5;
-				PRODUCT_BUNDLE_IDENTIFIER = com.youcai.meetmemo.tests;
+				PRODUCT_BUNDLE_IDENTIFIER = io.github.lingeringautumn.meetmemo.interview.tests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_VERSION = 5.0;
-				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/MeetMemo.app/Contents/MacOS/MeetMemo";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/MeetMemo Interview.app/Contents/MacOS/MeetMemo Interview";
 			};
 			name = Debug;
 		};
@@ -489,10 +487,10 @@
 				CODE_SIGN_STYLE = Manual;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 15.5;
-				PRODUCT_BUNDLE_IDENTIFIER = com.youcai.meetmemo.tests;
+				PRODUCT_BUNDLE_IDENTIFIER = io.github.lingeringautumn.meetmemo.interview.tests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_VERSION = 5.0;
-				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/MeetMemo.app/Contents/MacOS/MeetMemo";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/MeetMemo Interview.app/Contents/MacOS/MeetMemo Interview";
 			};
 			name = Release;
 		};
